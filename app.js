@@ -3,7 +3,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
   const HELPER = 'http://127.0.0.1:47800';
   const SID = Math.random().toString(36).slice(2, 10);
   const YT_ID = /^[A-Za-z0-9_-]{11}$/;
@@ -26,7 +26,16 @@
     document.title = outQ.shift();
     setTimeout(flush, 20);
   }
-  function log(msg) { send('log', { msg: String(msg).slice(0, 300) }); }
+  const pageLogQ = [];
+  function log(msg) {
+    msg = String(msg).slice(0, 300);
+    send('log', { msg: msg });
+    pageLogQ.push(new Date().toTimeString().slice(0, 8) + ' page: ' + msg);
+    if (pageLogQ.length > 100) pageLogQ.shift();
+  }
+  window.addEventListener('error', (e) => log('error: ' + e.message + ' at ' + (e.filename || '').split('/').pop() + ':' + e.lineno));
+  window.addEventListener('unhandledrejection', (e) => log('unhandled: ' + (e.reason && e.reason.message ? e.reason.message : e.reason)));
+  setInterval(() => { if (pageLogQ.length && helper.on) writeGameLog(pageLogQ.splice(0)); }, 5000);
 
   // ---------- storage ----------
   function load(key, fallback) {
@@ -811,6 +820,7 @@
       case 'source': switchSource(a); break;
       case 'rescan': if (S.source === 'folder') loadFolder(!P.cur); break;
       case 'pickFolder': pickFolder(); break;
+      case 'logs': writeGameLog(a); break;
       case 'zoom': document.documentElement.style.zoom = String(Number(a) || 1); break;
       case 'repaint':
         document.documentElement.classList.toggle('dlmrp');
@@ -818,6 +828,14 @@
         break;
       default: log('unknown command ' + cmd);
     }
+  }
+
+  // Game log lines go to game.log next to the helper, so bugs can be traced without -condebug.
+  function writeGameLog(lines) {
+    if (!helper.on || !Array.isArray(lines) || !lines.length) return;
+    const body = lines.map((l) => String(l).slice(0, 500)).join('\n');
+    fetch(HELPER + '/log', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: body, cache: 'no-store' })
+      .catch((e) => { console.warn('game log write failed', e); });
   }
 
   function applySettings(o) {
