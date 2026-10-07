@@ -3,7 +3,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.0.0';
+  const VERSION = '1.1.0';
   const HELPER = 'http://127.0.0.1:47800';
   const SID = Math.random().toString(36).slice(2, 10);
   const YT_ID = /^[A-Za-z0-9_-]{11}$/;
@@ -525,23 +525,72 @@
     return { id: YT_ID.test(id) ? id : '', list: /^[A-Za-z0-9_-]{10,64}$/.test(list) ? list : '', url: u.href };
   }
 
-  el('searchForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
+  let lastQuery = '', searchToken = 0, typeTimer = null;
+
+  async function doSearch(auto) {
+    if (typeTimer) { clearTimeout(typeTimer); typeTimer = null; }
     const text = el('searchInput').value.trim();
     if (!text) return;
-    if (S.source === 'folder') { switchSource('youtube'); send('source', { src: 'youtube' }); }
-    if (isUrl(text)) { openLink(text); return; }
-    if (!helper.on) { setNotice('Search needs Radiolock Helper. Paste a YouTube link instead.', true); return; }
+    if (isUrl(text)) {
+      if (auto) return;
+      if (S.source === 'folder') { switchSource('youtube'); send('source', { src: 'youtube' }); }
+      openLink(text);
+      return;
+    }
+    if (text === lastQuery) return;
+    if (!helper.on) { if (!auto) setNotice('Search needs Radiolock Helper. Paste a YouTube link instead.', true); return; }
+    lastQuery = text;
+    const token = ++searchToken;
     setNotice('Searching...');
     try {
       const j = await hget('/yt/search?q=' + encodeURIComponent(text), 30000);
+      if (token !== searchToken) return;
       results = j.ok ? j.items : [];
       setNotice(results.length ? '' : 'No results.');
-    } catch (err) { setNotice("Search failed. Is the helper still running?"); log('search failed: ' + err.message); }
+    } catch (err) {
+      if (token !== searchToken) return;
+      lastQuery = '';
+      setNotice('Search failed. Is the helper still running?');
+      log('search failed: ' + err.message);
+    }
     listTab = 'results';
     renderTabs();
     renderList();
+  }
+
+  el('searchForm').addEventListener('submit', (e) => { e.preventDefault(); lastQuery = ''; doSearch(false); });
+  // Enter may arrive as keydown or keyup depending on how the game forwards keys.
+  ['keydown', 'keyup'].forEach((type) => el('searchInput').addEventListener(type, (e) => {
+    if (e.key !== 'Enter' && e.keyCode !== 13) return;
+    e.preventDefault();
+    if (type === 'keydown') { lastQuery = ''; doSearch(false); } else doSearch(false);
+  }));
+  el('searchInput').addEventListener('input', () => {
+    if (typeTimer) clearTimeout(typeTimer);
+    const text = el('searchInput').value.trim();
+    if (text.length >= 3 && !isUrl(text)) typeTimer = setTimeout(() => doSearch(true), 1100);
   });
+
+  async function pickFolder() {
+    if (!helper.on) { setNotice('Choosing a folder needs Radiolock running.', true); return; }
+    setNotice('A folder window opened. If you do not see it, press Alt+Tab.', true);
+    try {
+      const j = await hget('/folder/pick?path=' + encodeURIComponent(S.folderPath || F.path || ''), 600000);
+      if (j.status === 'busy') { setNotice('The folder window is already open. Press Alt+Tab to find it.', true); return; }
+      if (!j.ok) { setNotice(j.status === 'cancelled' ? '' : "Couldn't open the folder window."); return; }
+      S.folderPath = j.path;
+      save('rl_settings', S);
+      send('folderpicked', { path: j.path });
+      setNotice('Music folder: ' + j.path);
+      if (S.source !== 'folder') { switchSource('folder'); send('source', { src: 'folder' }); return; }
+      useEngine('none');
+      P.cur = null;
+      F.idx = -1;
+      F.recent = [];
+      loadFolder(true);
+    } catch (e) { setNotice("Couldn't open the folder window."); log('folder pick failed: ' + e.message); }
+  }
+  el('pickBtn').addEventListener('click', () => pickFolder());
 
   async function openLink(text) {
     const l = parseLink(text);
@@ -602,6 +651,8 @@
 
   function renderTabs() {
     const folder = S.source === 'folder';
+    el('folderBar').hidden = listTab !== 'folder';
+    el('folderPathLbl').textContent = F.path || S.folderPath || 'No folder chosen';
     document.querySelectorAll('.tab').forEach((t) => {
       const name = t.dataset.list;
       t.hidden = folder ? name !== 'folder' : name === 'folder';
@@ -638,6 +689,7 @@
     empty.textContent = '';
     const frag = document.createDocumentFragment();
     if (listTab === 'folder') {
+      el('folderPathLbl').textContent = F.path || S.folderPath || 'No folder chosen';
       if (!helper.on) empty.innerHTML = 'Your music folder needs <b>Radiolock Helper</b> running on this PC.';
       else if (F.missing) empty.textContent = "Music folder not found. Set the folder path in the Playback tab.";
       else if (!F.loaded) empty.textContent = 'Loading your music folder...';
@@ -758,6 +810,7 @@
       case 'playId': if (YT_ID.test(String(a[0]))) { if (S.source !== 'youtube') switchSource('youtube'); playYouTube({ id: a[0], title: 'Loading...', channel: '', duration: 0 }, true, a[1] || 0); } break;
       case 'source': switchSource(a); break;
       case 'rescan': if (S.source === 'folder') loadFolder(!P.cur); break;
+      case 'pickFolder': pickFolder(); break;
       case 'zoom': document.documentElement.style.zoom = String(Number(a) || 1); break;
       case 'repaint':
         document.documentElement.classList.toggle('dlmrp');
