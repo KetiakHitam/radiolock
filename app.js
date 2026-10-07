@@ -3,7 +3,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.3.0';
+  const VERSION = '1.4.0';
   const HELPER = 'http://127.0.0.1:47800';
   const SID = Math.random().toString(36).slice(2, 10);
   const YT_ID = /^[A-Za-z0-9_-]{11}$/;
@@ -818,6 +818,10 @@
   function connectEvents() {
     if (events || !helper.on || typeof EventSource !== 'function') return;
     events = new EventSource(HELPER + '/events');
+    events.addEventListener('update', (e) => {
+      try { const d = JSON.parse(e.data); send('update', { text: String(d.text || '') }); if (d.text) setNotice(d.text, true); }
+      catch (err) { log('update event: ' + err.message); }
+    });
     events.addEventListener('hotkey', (e) => {
       try { onHotkey(JSON.parse(e.data).action); } catch (err) { log('hotkey event: ' + err.message); }
     });
@@ -1166,6 +1170,145 @@
     }
   }, 500);
 
+  // ---------- song sharing (relay on Cloudflare, notes encrypted here) ----------
+  // Room and key both come from the sorted player names, which the relay never sees.
+  const RELAY = 'wss://radiolock.ketiakhitam.workers.dev/r/';
+  const share = { ws: null, room: '', key: null, note: '', want: false, lastSend: 0, sendT: null, pingT: null,
+    retryT: null, fails: 0, sentReal: false, lastReal: '', peers: {} };
+
+  async function sha256Hex(text) {
+    const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    return [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, '0')).join('');
+  }
+  async function roomKey(src) {
+    const raw = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('radiolock-key|' + src));
+    return crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
+  }
+  function b64(u8) { let s = ''; for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]); return btoa(s); }
+  function unb64(t) { const r = atob(t); const u = new Uint8Array(r.length); for (let i = 0; i < r.length; i++) u[i] = r.charCodeAt(i); return u; }
+
+  async function onPeerCmd(a) {
+    a = a || {};
+    const src = String(a.room || ''), note = String(a.note || '');
+    share.want = !!(RELAY && src && a.on);
+    if (!share.want) { shareClose(); share.note = note; return; }
+    try {
+      const room = await sha256Hex('radiolock-room|' + src);
+      if (room !== share.room) {
+        shareClose();
+        share.room = room;
+        share.key = await roomKey(src);
+        share.note = note;
+        shareConnect();
+      } else if (note !== share.note) {
+        share.note = note;
+        shareSend();
+      }
+    } catch (e) { log('sharing setup failed: ' + e.message); }
+  }
+
+  function shareClose() {
+    const ws = share.ws;
+    share.ws = null; share.room = ''; share.key = null;
+    clearTimeout(share.retryT); clearTimeout(share.sendT); clearInterval(share.pingT);
+    share.retryT = null; share.sendT = null; share.pingT = null;
+    share.fails = 0; share.sentReal = false; share.lastReal = ''; share.peers = {};
+    if (ws) {
+      try { ws.close(); } catch (e) { log('sharing close: ' + e.message); }
+      send('peerstate', { on: false });
+    }
+  }
+
+  function shareConnect() {
+    if (!share.room || share.ws) return;
+    let ws;
+    try { ws = new WebSocket(RELAY + share.room); } catch (e) { log('sharing connect: ' + e.message); return; }
+    share.ws = ws;
+    ws.onopen = () => {
+      if (share.ws !== ws) return;
+      share.fails = 0;
+      send('peerstate', { on: true, room: share.room.slice(0, 6) });
+      shareSend();
+      share.pingT = setInterval(() => { try { ws.send('ping'); } catch (e) { log('sharing ping: ' + e.message); } }, 240000);
+    };
+    ws.onmessage = (e) => {
+      if (share.ws !== ws || e.data === 'pong') return;
+      let m;
+      try { m = JSON.parse(e.data); } catch (err) { return; }
+      if (m.type === 'note') shareRecv(m);
+      else if (m.type === 'gone') shareGone(m.from);
+    };
+    ws.onclose = () => {
+      if (share.ws !== ws) return;
+      share.ws = null;
+      clearInterval(share.pingT);
+      send('peerstate', { on: false });
+      share.fails++;
+      const delays = [8000, 30000, 120000, 300000];
+      if (share.want && share.room && share.fails <= 5) {
+        share.retryT = setTimeout(() => { share.retryT = null; shareConnect(); }, delays[Math.min(share.fails - 1, delays.length - 1)]);
+      }
+    };
+  }
+
+  // The relay drops notes sent less than 1.5 s apart, so sends are spaced 2.2 s.
+  function shareSend() {
+    const ws = share.ws;
+    if (!ws || ws.readyState !== 1 || !share.key) return;
+    if (!share.note && !share.sentReal) return;
+    const wait = 2200 - (Date.now() - share.lastSend);
+    if (wait > 0) { if (!share.sendT) share.sendT = setTimeout(() => { share.sendT = null; shareSend(); }, wait); return; }
+    share.lastSend = Date.now();
+    const real = !!share.note;
+    let body;
+    if (real) {
+      let o;
+      try { o = JSON.parse(share.note); } catch (e) { log('sharing note unreadable'); return; }
+      if (o.c && P.cur && P.cur.kind === 'yt') o.p = Math.max(0, Math.round(curTime()));
+      body = JSON.stringify(o);
+      share.lastReal = share.note;
+    } else {
+      let last = {};
+      try { last = JSON.parse(share.lastReal || '{}'); } catch (e) { last = {}; }
+      body = JSON.stringify({ off: 1, h: last.h || '', n: last.n || '' });
+    }
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, share.key, new TextEncoder().encode(body)).then((ct) => {
+      const all = new Uint8Array(12 + ct.byteLength);
+      all.set(iv, 0);
+      all.set(new Uint8Array(ct), 12);
+      try { ws.send(b64(all)); if (real) share.sentReal = true; send('peersent', { off: !real }); }
+      catch (e) { log('sharing send: ' + e.message); }
+    }).catch((e) => log('sharing encrypt: ' + e.name));
+  }
+
+  function shareRecv(m) {
+    if (!share.key || typeof m.data !== 'string' || m.data.length > 2048) return;
+    let all;
+    try { all = unb64(m.data); } catch (e) { return; }
+    if (all.length < 29) return;
+    crypto.subtle.decrypt({ name: 'AES-GCM', iv: all.slice(0, 12) }, share.key, all.slice(12)).then((pt) => {
+      const o = JSON.parse(new TextDecoder().decode(pt));
+      const nm = String(o.n || '').slice(0, 40), hr = String(o.h || '').slice(0, 40);
+      if (!nm && !hr) return;
+      share.peers[m.from] = { n: nm, h: hr };
+      const idm = /^y:([A-Za-z0-9_-]{11})$/.exec(String(o.c || ''));
+      let bs = String(o.b || '');
+      if (!/^(gold|silver|dark|neon|glass|off)$/.test(bs)) bs = '';
+      let ps = Number(o.p);
+      if (!(ps >= 0 && ps < 36000)) ps = -1;
+      send('peer', { n: nm, h: hr, id: idm ? idm[1] : '', t: String(o.t || '').replace(/[\u0000-\u001f]/g, '').slice(0, 60),
+        off: !!o.off, b: bs, p: ps, age: Math.min(3600000, Math.max(0, Number(m.age) || 0)) });
+    }).catch(() => { /* note from another room key or tampered, ignored by design */ });
+  }
+
+  function shareGone(from) {
+    const p = share.peers[from];
+    if (!p) return;
+    delete share.peers[from];
+    send('peer', { n: p.n, h: p.h, id: '', t: '', off: true, b: '', p: -1, age: 0 });
+  }
+
   // ---------- game to page ----------
   let lastSeq = 0;
   function onHash() {
@@ -1193,7 +1336,13 @@
       case 'next': next(); break;
       case 'prev': prev(); break;
       case 'seek': seek(a); break;
-      case 'playId': if (YT_ID.test(String(a[0]))) { if (S.source !== 'youtube') switchSource('youtube'); playYouTube({ id: a[0], title: 'Loading...', channel: '', duration: 0 }, true, a[1] || 0); } break;
+      case 'playId':
+        if (YT_ID.test(String(a[0]))) {
+          if (S.source !== 'youtube') { switchSource('youtube'); send('source', { src: 'youtube' }); }
+          playYouTube({ id: a[0], title: 'Loading...', channel: '', duration: 0 }, true, a[1] || 0);
+        }
+        break;
+      case 'peer': onPeerCmd(a); break;
       case 'source': switchSource(a); break;
       case 'rescan': if (S.source === 'folder') loadFolder(!P.cur); break;
       case 'pickFolder': pickFolder(); break;
