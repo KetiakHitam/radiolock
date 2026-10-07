@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Radiolock</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="app.css?v=1">
+</head>
+<body>
+<div id="app">
+  <form id="searchForm" class="search" autocomplete="off">
+    <input id="searchInput" type="text" placeholder="Search YouTube or paste a link" spellcheck="false">
+    <button id="searchBtn" type="submit">Search</button>
+  </form>
+
+  <div class="status">
+    <span id="sourceChip" class="chip">Starting...</span>
+    <span id="notice" class="notice"></span>
+  </div>
+
+  <section class="now">
+    <div id="artBox" class="art"><div id="artImg" class="artImg"></div><div id="ytHost"></div></div>
+    <div class="nowMain">
+      <div id="nowTitle" class="nowTitle">Nothing playing</div>
+      <div id="nowArtist" class="nowArtist"></div>
+      <div class="bar"><div id="barFill" class="barFill"></div></div>
+      <div class="times"><span id="timeCur">0:00</span><span id="timeDur">0:00</span></div>
+    </div>
+    <div class="ctrls">
+      <button id="btnPrev" class="ctrl" title="Previous">&#9198;</button>
+      <button id="btnPlay" class="ctrl play" title="Play">&#9654;</button>
+      <button id="btnNext" class="ctrl" title="Next">&#9197;</button>
+    </div>
+  </section>
+
+  <nav class="tabs">
+    <button data-list="results" class="tab on">Results</button>
+    <button data-list="queue" class="tab">Up next</button>
+    <button data-list="folder" class="tab">Folder</button>
+  </nav>
+  <ul id="list" class="list"></ul>
+  <div id="empty" class="empty"></div>
+</div>
+<audio id="audio" crossorigin="anonymous" preload="auto"></audio>
+<script src="app.js?v=1"></script>
+</body>
+</html>
