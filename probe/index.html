@@ -30,6 +30,8 @@
   'use strict';
   var HELPER = 'http://127.0.0.1:47800/ping';
   var TEST_VIDEO = 'dQw4w9WgXcQ';
+  var SECOND_VIDEO = 'kJQP7kiw5Fk';
+  var clicked = false, secondDone = false;
 
   var logEl = document.getElementById('log');
   function local(msg) { logEl.textContent = msg + '\n' + logEl.textContent.slice(0, 4000); }
@@ -103,6 +105,12 @@
       setTimeout(function () { send('unmuted', { muted: player.isMuted(), state: player.getPlayerState() }); }, 800);
     } else if (c.op === 'play' && player && player.playVideo) {
       player.playVideo();
+      setTimeout(function () { send('afterplay', { state: player.getPlayerState(), muted: player.isMuted() }); }, 1500);
+    } else if (c.op === 'pause' && player && player.pauseVideo) {
+      player.pauseVideo();
+    } else if (c.op === 'next' && player && player.loadVideoById) {
+      player.loadVideoById(c.id || SECOND_VIDEO);
+      setTimeout(function () { send('afternext', { state: player.getPlayerState(), muted: player.isMuted() }); }, 4000);
     } else if (c.op === 'burst') {
       burst(Number(c.gap || 0), Number(c.count || 20));
     } else if (c.op === 'helper') {
@@ -158,9 +166,27 @@
           }, 3000);
           setInterval(sample, 1000);
         },
-        onStateChange: function (e) { send('ytstate', { s: e.data, t: Math.round(player.getCurrentTime() * 10) / 10, dur: Math.round(player.getDuration()) }); },
+        onStateChange: function (e) {
+          send('ytstate', { s: e.data, t: Math.round(player.getCurrentTime() * 10) / 10, dur: Math.round(player.getDuration()), muted: player.isMuted() });
+          // After a real click, check that a page-driven song change keeps sound.
+          if (clicked && !secondDone && e.data === 1 && !player.isMuted()) {
+            secondDone = true;
+            setTimeout(function () {
+              send('autonext', { step: 'loading second video' });
+              player.loadVideoById(SECOND_VIDEO);
+              setTimeout(function () {
+                send('autonext', { state: player.getPlayerState(), muted: player.isMuted(), id: (player.getVideoData() || {}).video_id });
+                try { send('debugtext', { text: String(player.getDebugText()).slice(0, 700) }); } catch (err) { send('debugtext', { err: err.name }); }
+              }, 5000);
+            }, 8000);
+          }
+        },
         onError: function (e) { send('yterr', { code: e.data }); }
       }
+    });
+    // Undocumented events that may signal ads. Harmless if they never fire.
+    ['onAdStart', 'onAdEnd', 'onAdStateChange', 'onAdAnnotationStateChange', 'onApiChange', 'onPlaybackQualityChange', 'onAutoplayBlocked'].forEach(function (ev) {
+      try { player.addEventListener(ev, function (e) { send('ytev', { ev: ev, data: JSON.stringify(e && e.data !== undefined ? e.data : null).slice(0, 200) }); }); } catch (err) { send('ytev', { ev: ev, err: err.name }); }
     });
   };
   function sample() {
@@ -184,8 +210,13 @@
   document.head.appendChild(tag);
 
   document.getElementById('btnPlay').addEventListener('click', function () {
+    clicked = true;
     send('click', { what: 'play' });
-    if (player && player.playVideo) { player.unMute(); player.playVideo(); }
+    if (player && player.playVideo) {
+      player.unMute();
+      player.playVideo();
+      setTimeout(function () { send('afterclick', { state: player.getPlayerState(), muted: player.isMuted() }); }, 2000);
+    }
   });
 
   // Local files.
