@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Radiolock probe</title>
+<style>
+  body { margin: 0; padding: 12px; background: #1b1b1b; color: #e8e2d6; font: 13px/1.4 sans-serif; }
+  h1 { font-size: 16px; margin: 0 0 8px; color: #74d9a9; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; align-items: center; }
+  button, label.btn { background: #3a3a3a; color: #e8e2d6; border: 1px solid #555; padding: 6px 10px; cursor: pointer; font: inherit; }
+  input[type=file] { display: none; }
+  #yt { width: 320px; height: 180px; background: #000; }
+  #log { height: 150px; overflow: auto; background: #111; padding: 6px; font: 11px monospace; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Radiolock probe</h1>
+<div class="row">
+  <button id="btnPlay">1. Play YouTube</button>
+  <label class="btn">2. Pick files<input id="pickFiles" type="file" multiple accept="audio/*"></label>
+  <label class="btn">3. Pick folder<input id="pickDir" type="file" webkitdirectory multiple></label>
+  <button id="btnDirApi">4. Folder (API)</button>
+</div>
+<div id="yt"></div>
+<audio id="aud"></audio>
+<div id="log"></div>
+<script>
+(function () {
+  'use strict';
+  var HELPER = 'http://127.0.0.1:47800/ping';
+  var TEST_VIDEO = 'dQw4w9WgXcQ';
+
+  var logEl = document.getElementById('log');
+  function local(msg) { logEl.textContent = msg + '\n' + logEl.textContent.slice(0, 4000); }
+
+  // Page to game channel: document.title, rate limited queue.
+  var outQ = [], sending = false, sent = 0;
+  function flush() {
+    if (!outQ.length) { sending = false; return; }
+    sending = true;
+    document.title = outQ.shift();
+    setTimeout(flush, 70);
+  }
+  function send(t, d) {
+    var msg = JSON.stringify({ t: t, n: ++sent, d: d || {} });
+    local('> ' + msg);
+    outQ.push(msg);
+    if (outQ.length > 60) outQ.splice(0, outQ.length - 60);
+    if (!sending) flush();
+  }
+
+  var loads = 1;
+  try { loads = Number(sessionStorage.getItem('rlp_loads') || 0) + 1; sessionStorage.setItem('rlp_loads', String(loads)); } catch (e) { local('sessionStorage error: ' + e.name); }
+  var navType = '?';
+  try { var nav = performance.getEntriesByType('navigation')[0]; navType = nav ? nav.type : 'none'; } catch (e) { navType = 'err ' + e.name; }
+
+  function mem() {
+    try { return performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : -1; } catch (e) { return -2; }
+  }
+
+  send('boot', {
+    ua: navigator.userAgent.slice(0, 160),
+    loads: loads,
+    nav: navType,
+    hash: location.hash.slice(0, 60),
+    secure: window.isSecureContext,
+    dirApi: typeof window.showDirectoryPicker === 'function',
+    idb: !!window.indexedDB,
+    ac: !!(window.AudioContext || window.webkitAudioContext),
+    mem: mem()
+  });
+
+  // Game to page channel: URL fragment.
+  var lastSeq = 0, hashCount = 0;
+  function parseHash() {
+    var out = {};
+    location.hash.replace(/^#/, '').split('&').forEach(function (kv) {
+      if (!kv) return;
+      var i = kv.indexOf('=');
+      var k = i < 0 ? kv : kv.slice(0, i);
+      var v = i < 0 ? '' : kv.slice(i + 1);
+      try { out[decodeURIComponent(k)] = decodeURIComponent(v); } catch (e) { out[k] = v; }
+    });
+    return out;
+  }
+  window.addEventListener('hashchange', function () {
+    hashCount++;
+    var c = parseHash();
+    var seq = Number(c.s || 0);
+    var reply = { s: seq, op: c.op || '', loads: loads, count: hashCount, gap: seq - lastSeq };
+    lastSeq = seq;
+    try { runOp(c, reply); } catch (e) { reply.err = e.name + ': ' + e.message; }
+    send('ack', reply);
+  });
+
+  function runOp(c, reply) {
+    if (c.op === 'vol' && player && player.setVolume) {
+      player.setVolume(Number(c.v));
+      reply.vol = player.getVolume ? player.getVolume() : -1;
+    } else if (c.op === 'unmute' && player && player.unMute) {
+      player.unMute();
+      setTimeout(function () { send('unmuted', { muted: player.isMuted(), state: player.getPlayerState() }); }, 800);
+    } else if (c.op === 'play' && player && player.playVideo) {
+      player.playVideo();
+    } else if (c.op === 'burst') {
+      burst(Number(c.gap || 0), Number(c.count || 20));
+    } else if (c.op === 'helper') {
+      probeHelper();
+    } else if (c.op === 'mem') {
+      reply.mem = mem();
+    }
+  }
+
+  // Throughput test for the title channel. Bypasses the queue.
+  function burst(gap, count) {
+    var i = 0;
+    function one() {
+      document.title = JSON.stringify({ t: 'b', d: { gap: gap, i: i } });
+      if (++i < count) { if (gap > 0) setTimeout(one, gap); else one(); }
+    }
+    one();
+  }
+
+  // Localhost helper reachability (mixed content and private network rules).
+  function probeHelper() {
+    var started = Date.now();
+    fetch(HELPER, { cache: 'no-store' }).then(function (r) { return r.text().then(function (t) {
+      send('helper', { ok: r.ok, status: r.status, body: t.slice(0, 40), ms: Date.now() - started });
+    }); }).catch(function (e) {
+      send('helper', { ok: false, err: String(e && e.message || e).slice(0, 120), ms: Date.now() - started });
+    });
+  }
+  setTimeout(probeHelper, 1500);
+
+  // YouTube embed.
+  var player = null, ytSamples = 0, lastState = null;
+  window.onYouTubeIframeAPIReady = function () {
+    send('yt', { step: 'api ready' });
+    player = new YT.Player('yt', {
+      width: 320, height: 180, videoId: TEST_VIDEO,
+      playerVars: { autoplay: 1, playsinline: 1, rel: 0 },
+      events: {
+        onReady: function () {
+          var fns = [];
+          for (var k in player) if (typeof player[k] === 'function') fns.push(k);
+          send('yt', { step: 'ready', fns: fns.join(',').slice(0, 900) });
+          player.setVolume(30);
+          player.playVideo();
+          setTimeout(function () {
+            var st = player.getPlayerState();
+            send('yt', { step: 'autoplay check', state: st, muted: player.isMuted() });
+            if (st !== 1) {
+              player.mute();
+              player.playVideo();
+              setTimeout(function () { send('yt', { step: 'muted autoplay check', state: player.getPlayerState() }); }, 2500);
+            }
+          }, 3000);
+          setInterval(sample, 1000);
+        },
+        onStateChange: function (e) { send('ytstate', { s: e.data, t: Math.round(player.getCurrentTime() * 10) / 10, dur: Math.round(player.getDuration()) }); },
+        onError: function (e) { send('yterr', { code: e.data }); }
+      }
+    });
+  };
+  function sample() {
+    if (!player || !player.getPlayerState || ytSamples >= 90) return;
+    ytSamples++;
+    var vd = {};
+    try { vd = player.getVideoData ? player.getVideoData() : {}; } catch (e) { vd = { err: e.name }; }
+    var st = player.getPlayerState();
+    var key = [st, vd.video_id, Math.round(player.getDuration())].join('|');
+    if (key === lastState && ytSamples % 10 !== 0) return;
+    lastState = key;
+    send('yts', {
+      st: st, id: vd.video_id || '', title: String(vd.title || '').slice(0, 40), author: String(vd.author || '').slice(0, 30),
+      t: Math.round(player.getCurrentTime() * 10) / 10, dur: Math.round(player.getDuration() * 10) / 10,
+      vol: player.getVolume(), muted: player.isMuted(), frac: Math.round(player.getVideoLoadedFraction() * 100), mem: mem()
+    });
+  }
+  var tag = document.createElement('script');
+  tag.src = 'https://www.youtube.com/iframe_api';
+  tag.onerror = function () { send('yt', { step: 'api script failed to load' }); };
+  document.head.appendChild(tag);
+
+  document.getElementById('btnPlay').addEventListener('click', function () {
+    send('click', { what: 'play' });
+    if (player && player.playVideo) { player.unMute(); player.playVideo(); }
+  });
+
+  // Local files.
+  var aud = document.getElementById('aud');
+  aud.volume = 0.3;
+  aud.addEventListener('playing', function () { send('audio', { step: 'playing', dur: Math.round(aud.duration) }); });
+  aud.addEventListener('error', function () { send('audio', { step: 'error', code: aud.error ? aud.error.code : -1 }); });
+
+  function onFiles(kind, list) {
+    var files = Array.prototype.slice.call(list || []);
+    var audio = files.filter(function (f) { return /\.(mp3|m4a|aac|ogg|opus|wav|flac|webm)$/i.test(f.name); });
+    send('files', {
+      kind: kind, total: files.length, audio: audio.length,
+      first: audio.slice(0, 3).map(function (f) { return (f.webkitRelativePath || f.name).slice(0, 60); })
+    });
+    if (audio.length) {
+      if (player && player.pauseVideo) player.pauseVideo();
+      aud.src = URL.createObjectURL(audio[0]);
+      aud.play().catch(function (e) { send('audio', { step: 'play rejected', err: e.name }); });
+    }
+  }
+  document.getElementById('pickFiles').addEventListener('change', function (e) { onFiles('files', e.target.files); });
+  document.getElementById('pickDir').addEventListener('change', function (e) { onFiles('dir', e.target.files); });
+  document.getElementById('btnDirApi').addEventListener('click', function () {
+    if (typeof window.showDirectoryPicker !== 'function') { send('dirapi', { ok: false, why: 'missing' }); return; }
+    window.showDirectoryPicker().then(function (h) {
+      send('dirapi', { ok: true, name: h.name });
+    }).catch(function (e) { send('dirapi', { ok: false, why: e.name }); });
+  });
+})();
+</script>
+</body>
+</html>
