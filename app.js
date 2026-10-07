@@ -3,7 +3,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.2.0';
+  const VERSION = '1.3.0';
   const HELPER = 'http://127.0.0.1:47800';
   const SID = Math.random().toString(36).slice(2, 10);
   const YT_ID = /^[A-Za-z0-9_-]{11}$/;
@@ -47,7 +47,7 @@
 
   const S = Object.assign({
     source: 'youtube', folderPath: '', skipAds: true, visualizer: true, shuffle: true,
-    rememberSong: false, onlineArt: true, browserZoom: 0
+    rememberSong: false, onlineArt: true, levelLoud: true, browserZoom: 0
   }, load('rl_settings', {}));
 
   // ---------- helper ----------
@@ -76,6 +76,7 @@
     if (first || helper.on !== was) {
       send('helper', { on: helper.on, status: helper.info ? helper.info.status : '' });
       log('helper ' + (helper.on ? 'connected' : 'not running'));
+      if (helper.on) { connectEvents(); loadLib(); sendHotkeys(); } else { disconnectEvents(); send('hotkeys', { helper: false }); }
       if (!first) onHelperChange();
     }
     renderStatus();
@@ -115,7 +116,9 @@
   let fadeTimer = null;
   function applyVol() {
     const v = P.adMuted ? 0 : Math.max(0, Math.min(100, P.vol));
-    audio.volume = v / 100;
+    // With the audio graph, the element stays at full volume so loudness can be measured; the gain node sets volume.
+    if (graph) { audio.volume = 1; graph.vol.gain.setTargetAtTime(v / 100, graph.ctx.currentTime, 0.02); }
+    else audio.volume = v / 100;
     if (embed.player && embed.ready) {
       try { if (P.adMuted) embed.player.mute(); else { embed.player.unMute(); embed.player.setVolume(Math.round(v)); } } catch (e) { log('embed volume: ' + e.message); }
     }
@@ -133,7 +136,7 @@
   }
 
   // ---------- audio engine (helper YouTube and folder) ----------
-  audio.addEventListener('playing', () => { P.playing = true; P.errors = 0; send('play'); renderNow(); vizSetup(); });
+  audio.addEventListener('playing', () => { P.playing = true; P.errors = 0; send('play'); renderNow(); graphSetup(); noteRecent(); });
   audio.addEventListener('pause', () => { if (P.engine !== 'audio') return; P.playing = false; send('pause'); renderNow(); });
   audio.addEventListener('ended', () => { if (P.engine === 'audio') next(); });
   audio.addEventListener('error', () => {
@@ -148,7 +151,8 @@
   function tryPlay() {
     if (P.engine === 'audio') {
       const pr = audio.play();
-      if (pr && pr.catch) pr.catch((e) => { if (e.name === 'NotAllowedError') needClick(); else log('play failed: ' + e.name); });
+      // AbortError only means a newer song replaced this one before it started.
+      if (pr && pr.catch) pr.catch((e) => { if (e.name === 'NotAllowedError') needClick(); else if (e.name !== 'AbortError') log('play failed: ' + e.name); });
     } else if (P.engine === 'embed' && embed.player && embed.ready) {
       embed.player.playVideo();
       setTimeout(() => { if (P.engine === 'embed' && !P.playing && !P.activated) needClick(); }, 2500);
@@ -237,7 +241,7 @@
 
   function embedState(st) {
     if (P.engine !== 'embed') return;
-    if (st === 1) { P.playing = true; P.errors = 0; send('play'); embedMeta(); }
+    if (st === 1) { P.playing = true; P.errors = 0; send('play'); embedMeta(); noteRecent(); }
     else if (st === 2) { P.playing = false; send('pause'); }
     else if (st === 0) { P.playing = false; send('pause'); }
     else if (st === 5 || st === -1) embedMeta();
@@ -283,27 +287,109 @@
   // ---------- current track ----------
   function setCurrent(c) {
     P.cur = c;
+    P.recentNoted = false;
     if (c.kind === 'yt') send('meta', { id: c.id, title: c.title || 'Unknown', author: c.author || '' });
     else send('meta', { id: '', title: c.title || 'Unknown', author: c.author || '', art: '' });
     renderNow();
     if (c.kind === 'folder') folderArt(c);
+    meterReset();
+    sendFavState();
   }
 
-  // ---------- YouTube via helper ----------
+  // ---------- queue (helper mode, YouTube and folder songs mixed) ----------
+  // Queue items: { kind: 'yt', id, title, channel, duration } or { kind: 'folder', rel, folder, title, channel }.
+  function kindOf(it) { return it.kind === 'folder' ? 'folder' : 'yt'; }
+  function itemKey(it) {
+    return kindOf(it) === 'yt' ? 'y:' + it.id : 'f:' + String(it.folder || '').toLowerCase() + '|' + String(it.rel || '').toLowerCase();
+  }
+
   function playQueueAt(i, autoplay, at) {
     if (i < 0 || i >= Q.items.length) return;
     Q.idx = i;
+    P.queueMode = true;
     const it = Q.items[i];
-    setCurrent({ kind: 'yt', id: it.id, title: it.title, author: it.channel, duration: it.duration });
-    startAudio(HELPER + '/yt/audio?id=' + it.id, autoplay, at);
+    if (kindOf(it) === 'folder') {
+      setCurrent({ kind: 'folder', rel: it.rel, folder: it.folder, title: it.title, author: it.channel || '', duration: 0 });
+      startAudio(folderSrc(it.rel, 'file', it.folder), autoplay, at);
+    } else {
+      setCurrent({ kind: 'yt', id: it.id, title: it.title, author: it.channel, duration: it.duration });
+      startAudio(HELPER + '/yt/audio?id=' + it.id, autoplay, at);
+    }
     afterTrackChange();
   }
 
   function afterTrackChange() {
     renderList();
     const nx = Q.items[Q.idx + 1];
-    if (nx) hget('/yt/prefetch?id=' + nx.id, 5000).catch(() => {});
+    if (nx && kindOf(nx) === 'yt') hget('/yt/prefetch?id=' + nx.id, 5000).catch(() => {});
     if (Q.items.length - Q.idx <= 3) extendWithMix();
+  }
+
+  // Current song as a queue item, so a queue can start from whatever is playing.
+  function currentAsItem() {
+    const c = P.cur;
+    if (!c) return null;
+    if (c.kind === 'folder') return { kind: 'folder', rel: c.rel, folder: c.folder || F.path || S.folderPath || '', title: c.title, channel: c.author || '' };
+    return c.id ? { kind: 'yt', id: c.id, title: c.title, channel: c.author || '', duration: c.duration || 0 } : null;
+  }
+
+  function ensureQueueMode() {
+    if (P.queueMode) return true;
+    const cur = currentAsItem();
+    if (!cur || P.engine !== 'audio') return false;
+    Q.items = [cur];
+    Q.idx = 0;
+    Q.mixFor = '';
+    P.queueMode = true;
+    return true;
+  }
+
+  // where: 'next' puts it right after the current song, 'end' at the end of the queue.
+  function queueInsert(item, where) {
+    if (!helper.on) {
+      if (kindOf(item) === 'yt') playYouTube(item, true); else setNotice('Folder songs need Radiolock running.');
+      return;
+    }
+    if (!ensureQueueMode()) { Q.items = [item]; Q.mixFor = ''; playQueueAt(0, true); return; }
+    const key = itemKey(item);
+    const existing = Q.items.findIndex((x, i) => i > Q.idx && itemKey(x) === key);
+    if (existing >= 0) Q.items.splice(existing, 1);
+    if (where === 'next') Q.items.splice(Q.idx + 1, 0, item); else Q.items.push(item);
+    setNotice(where === 'next' ? 'Plays next.' : 'Added to the end of Up next.');
+    afterTrackChange();
+  }
+
+  function queueMove(from, to) {
+    if (from <= Q.idx || to <= Q.idx || from >= Q.items.length) return;
+    const [it] = Q.items.splice(from, 1);
+    Q.items.splice(Math.min(to, Q.items.length), 0, it);
+    afterTrackChange();
+  }
+
+  function queueRemove(i) {
+    if (i <= Q.idx || i >= Q.items.length) return;
+    Q.items.splice(i, 1);
+    afterTrackChange();
+  }
+
+  function playList(items, start, shuffle) {
+    if (!items.length) return;
+    let list = items.slice();
+    if (shuffle) {
+      for (let i = list.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const t = list[i]; list[i] = list[j]; list[j] = t; }
+      start = 0;
+    }
+    if (!helper.on) {
+      const yt = list.filter((x) => kindOf(x) === 'yt');
+      if (!yt.length) { setNotice('Folder songs need Radiolock running.'); return; }
+      playYouTube(yt[Math.min(start, yt.length - 1)], true);
+      return;
+    }
+    Q.items = list;
+    Q.mixFor = '';
+    listTab = 'queue';
+    renderTabs();
+    playQueueAt(Math.max(0, Math.min(start, list.length - 1)), true);
   }
 
   async function extendWithMix() {
@@ -335,13 +421,6 @@
     }
   }
 
-  function addToQueue(item) {
-    if (!helper.on) { playYouTube(item, true); return; }
-    if (Q.idx < 0) { Q.items = [item]; playQueueAt(0, true); return; }
-    Q.items.splice(Q.idx + 1, 0, item);
-    setNotice('Added to Up next.');
-    afterTrackChange();
-  }
 
   // ---------- folder ----------
   async function loadFolder(autostart) {
@@ -375,8 +454,13 @@
     }
   }
 
-  function folderSrc(rel, what) {
-    return HELPER + '/folder/' + what + '?path=' + encodeURIComponent(F.path || S.folderPath || '') + '&f=' + encodeURIComponent(rel);
+  function folderSrc(rel, what, folder) {
+    return HELPER + '/folder/' + what + '?path=' + encodeURIComponent(folder || F.path || S.folderPath || '') + '&f=' + encodeURIComponent(rel);
+  }
+
+  function folderItem(f) {
+    const nm = splitName(f.name);
+    return { kind: 'folder', rel: f.rel, folder: F.path || S.folderPath || '', title: nm.title, channel: nm.author };
   }
 
   function playFolderAt(i, autoplay, at) {
@@ -384,9 +468,10 @@
     i = ((i % F.files.length) + F.files.length) % F.files.length;
     if (F.idx >= 0 && F.idx !== i) { F.recent.push(F.idx); if (F.recent.length > 100) F.recent.shift(); }
     F.idx = i;
+    P.queueMode = false;
     const f = F.files[i];
     const nm = splitName(f.name);
-    setCurrent({ kind: 'folder', rel: f.rel, title: nm.title, author: nm.author, duration: 0 });
+    setCurrent({ kind: 'folder', rel: f.rel, folder: F.path || S.folderPath || '', title: nm.title, author: nm.author, duration: 0 });
     startAudio(folderSrc(f.rel, 'file'), autoplay, at);
     renderList();
   }
@@ -412,7 +497,7 @@
   async function folderArt(c) {
     const want = c.rel;
     try {
-      const r = await fetch(folderSrc(c.rel, 'cover'), { cache: 'no-store' });
+      const r = await fetch(folderSrc(c.rel, 'cover', c.folder), { cache: 'no-store' });
       if (r.ok) {
         const url = await squareJpeg(await r.blob());
         if (url && P.cur && P.cur.rel === want) { send('art', { u: url, square: true }); setArt(url); }
@@ -458,15 +543,17 @@
 
   // ---------- transport ----------
   function next() {
-    if (S.source === 'folder') { folderNext(); return; }
     if (P.engine === 'embed') { try { embed.player.nextVideo(); } catch (e) { log('embed next: ' + e.message); } return; }
-    if (Q.idx + 1 < Q.items.length) playQueueAt(Q.idx + 1, true);
-    else { extendWithMix().then(() => { if (Q.idx + 1 < Q.items.length) playQueueAt(Q.idx + 1, true); }); }
+    if (!P.queueMode && S.source === 'folder') { folderNext(); return; }
+    if (Q.idx + 1 < Q.items.length) { playQueueAt(Q.idx + 1, true); return; }
+    // End of the queue: keep a radio going for YouTube songs, otherwise fall back to the folder.
+    if (P.cur && P.cur.kind === 'yt') { extendWithMix().then(() => { if (Q.idx + 1 < Q.items.length) playQueueAt(Q.idx + 1, true); }); return; }
+    if (S.source === 'folder' && F.files.length) { P.queueMode = false; folderNext(); }
   }
   function prev() {
-    if (S.source === 'folder') { folderPrev(); return; }
     if (curTime() > 3) { seek(0); return; }
     if (P.engine === 'embed') { try { embed.player.previousVideo(); } catch (e) { log('embed prev: ' + e.message); } return; }
+    if (!P.queueMode && S.source === 'folder') { folderPrev(); return; }
     if (Q.idx > 0) playQueueAt(Q.idx - 1, true); else seek(0);
   }
   function play() {
@@ -490,7 +577,7 @@
     const first = !P.activated;
     P.activated = true;
     if (P.pendingPlay) { P.pendingPlay = false; setNotice(''); tryPlay(); }
-    if (first) vizSetup();
+    if (first) graphSetup();
   }, true);
 
   // ---------- source switching ----------
@@ -656,22 +743,160 @@
     else if (c.kind === 'yt' && c.id) setArt(thumb(c.id));
     else if (c.kind === 'folder') setArt('');
     el('btnPlay').innerHTML = P.playing ? '&#10074;&#10074;' : '&#9654;';
+    el('btnFav').classList.toggle('on', isFav(currentAsItem()));
+    el('btnFav').hidden = !helper.on || !c;
   }
 
   function renderTabs() {
     const folder = S.source === 'folder';
     el('folderBar').hidden = listTab !== 'folder';
+    el('libBar').hidden = listTab !== 'favorites';
     el('folderPathLbl').textContent = F.path || S.folderPath || 'No folder chosen';
     document.querySelectorAll('.tab').forEach((t) => {
       const name = t.dataset.list;
-      t.hidden = folder ? name !== 'folder' : name === 'folder';
+      t.hidden = name === 'folder' ? !folder : (name === 'results' ? folder : false);
       t.classList.toggle('on', name === listTab);
     });
+  }
+
+  // ---------- library: favorites and recently played ----------
+  const LIB = { fav: [], recent: [], favKeys: new Set(), loaded: false };
+
+  function libItemFor(it) {
+    if (kindOf(it) === 'folder') return { kind: 'folder', rel: it.rel, folder: it.folder || '', title: it.title, author: it.channel || it.author || '' };
+    return { kind: 'yt', id: it.id, title: it.title, author: it.channel || it.author || '', duration: it.duration || 0 };
+  }
+  function libToItem(x) {
+    if (x.kind === 'folder') return { kind: 'folder', rel: x.rel, folder: x.folder, title: x.title, channel: x.author };
+    return { kind: 'yt', id: x.id, title: x.title, channel: x.author, duration: x.duration };
+  }
+
+  async function hpost(path, obj) {
+    const r = await fetch(HELPER + path, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify(obj), cache: 'no-store' });
+    return r.json();
+  }
+
+  async function loadLib() {
+    if (!helper.on) return;
+    try {
+      const j = await hget('/lib', 5000);
+      if (!j.ok) return;
+      LIB.fav = j.favorites;
+      LIB.recent = j.recent;
+      LIB.favKeys = new Set(j.favorites.map((x) => x.key));
+      LIB.loaded = true;
+      if (listTab === 'favorites' || listTab === 'recent') renderList();
+      renderNow();
+      sendFavState();
+    } catch (e) { log('library load failed: ' + e.message); }
+  }
+
+  async function toggleFav(it, want) {
+    if (!it) return;
+    if (!helper.on) { setNotice('Favorites need Radiolock running.'); return; }
+    try {
+      const j = await hpost('/lib/fav', { item: libItemFor(it), on: want === undefined ? null : want });
+      if (!j.ok) { setNotice("Couldn't change favorites."); return; }
+      setNotice(j.on ? 'Added to favorites.' : 'Removed from favorites.');
+      await loadLib();
+    } catch (e) { log('favorite failed: ' + e.message); }
+  }
+
+  function isFav(it) { return !!(it && LIB.favKeys.has(itemKey(it))); }
+  function sendFavState() { send('fav', { on: isFav(currentAsItem()) }); }
+
+  function noteRecent() {
+    if (P.recentNoted || !helper.on) return;
+    const it = currentAsItem();
+    if (!it) return;
+    P.recentNoted = true;
+    hpost('/lib/recent', { item: libItemFor(it) }).then(() => loadLib()).catch((e) => log('recent failed: ' + e.message));
+  }
+
+  // ---------- hotkeys (bound in the helper, pressed keys arrive as events) ----------
+  let events = null;
+  function connectEvents() {
+    if (events || !helper.on || typeof EventSource !== 'function') return;
+    events = new EventSource(HELPER + '/events');
+    events.addEventListener('hotkey', (e) => {
+      try { onHotkey(JSON.parse(e.data).action); } catch (err) { log('hotkey event: ' + err.message); }
+    });
+  }
+  function disconnectEvents() { if (events) { events.close(); events = null; } }
+
+  function onHotkey(action) {
+    switch (action) {
+      case 'playpause': if (P.playing) pause(); else play(); break;
+      case 'next': next(); break;
+      case 'prev': prev(); break;
+      case 'fav': toggleFav(currentAsItem()); break;
+      case 'quiet': case 'volup': case 'voldown': send('hotkey', { action: action }); break;
+      default: log('unknown hotkey ' + action);
+    }
+  }
+
+  async function sendHotkeys(status) {
+    if (!helper.on) { send('hotkeys', { helper: false }); return; }
+    try {
+      const j = await hget('/hotkeys', 5000);
+      send('hotkeys', { binds: j.binds, status: status || '' });
+    } catch (e) { log('hotkeys read failed: ' + e.message); }
+  }
+
+  async function setHotkey(action, clear) {
+    if (!helper.on) { send('hotkeys', { helper: false }); return; }
+    try {
+      if (!clear) setNotice('Press the keys in the Radiolock window. If you do not see it, press Alt+Tab.', true);
+      const j = await hget('/hotkeys/' + (clear ? 'clear' : 'capture') + '?action=' + encodeURIComponent(action), 180000);
+      setNotice('');
+      send('hotkeys', { binds: j.binds, status: j.status || '', action: action });
+    } catch (e) { log('hotkey change failed: ' + e.message); }
+  }
+
+  // ---------- row menu ----------
+  const menuEl = el('menu');
+  function closeMenu() { menuEl.hidden = true; }
+  function openMenu(anchor, entries) {
+    menuEl.textContent = '';
+    entries.forEach((en) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = en.label;
+      b.addEventListener('click', (ev) => { ev.stopPropagation(); closeMenu(); en.fn(); });
+      menuEl.append(b);
+    });
+    menuEl.hidden = false;
+    const r = anchor.getBoundingClientRect();
+    const mh = menuEl.offsetHeight, mw = menuEl.offsetWidth;
+    const top = r.bottom + 4 + mh > window.innerHeight ? r.top - mh - 4 : r.bottom + 4;
+    menuEl.style.top = Math.max(4, top) + 'px';
+    menuEl.style.left = Math.max(4, r.right - mw) + 'px';
+  }
+  document.addEventListener('pointerdown', (e) => { if (!menuEl.hidden && !menuEl.contains(e.target)) closeMenu(); }, true);
+  el('list').addEventListener('scroll', closeMenu);
+
+  function favEntry(it) {
+    const on = isFav(it);
+    return { label: on ? 'Remove from favorites' : 'Add to favorites', fn: () => toggleFav(it, !on) };
+  }
+  function queueEntries(it) {
+    return [
+      { label: 'Play next', fn: () => queueInsert(it, 'next') },
+      { label: 'Add to end of queue', fn: () => queueInsert(it, 'end') }
+    ];
   }
 
   function itemRow(o) {
     const li = document.createElement('li');
     li.className = 'item' + (o.cur ? ' cur' : '');
+    if (o.qi !== undefined) li.dataset.qi = String(o.qi);
+    if (o.drag) {
+      const grip = document.createElement('span');
+      grip.className = 'grip';
+      grip.title = 'Drag to move';
+      li.append(grip);
+      enableDrag(li, grip, o.qi);
+    }
     const th = document.createElement('div');
     th.className = 'thumb' + (o.thumb ? '' : ' note');
     if (o.thumb) th.style.backgroundImage = 'url("' + o.thumb + '")'; else th.textContent = '♪';
@@ -682,46 +907,129 @@
     meta.append(t, s);
     li.append(th, meta);
     if (o.dur) { const d = document.createElement('div'); d.className = 'dur'; d.textContent = fmt(o.dur); li.append(d); }
-    if (o.add) {
-      const b = document.createElement('button'); b.textContent = '+ Queue';
-      b.addEventListener('click', (e) => { e.stopPropagation(); o.add(); });
+    if (o.menu && helper.on) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'more';
+      b.title = 'More';
+      for (let i = 0; i < 3; i++) b.append(document.createElement('i'));
+      b.addEventListener('click', (e) => { e.stopPropagation(); openMenu(b, o.menu()); });
       li.append(b);
     }
     li.addEventListener('click', o.play);
     return li;
   }
 
+  // Drag a queue row by its grip to a new position.
+  function enableDrag(li, grip, index) {
+    grip.addEventListener('click', (e) => e.stopPropagation());
+    grip.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      closeMenu();
+      grip.setPointerCapture(e.pointerId);
+      const list = el('list');
+      const rows = [...list.children];
+      let target = index;
+      li.classList.add('dragging');
+      const clear = () => rows.forEach((r) => r.classList.remove('dropAbove', 'dropBelow'));
+      const move = (ev) => {
+        const lr = list.getBoundingClientRect();
+        if (ev.clientY < lr.top + 24) list.scrollTop -= 12;
+        else if (ev.clientY > lr.bottom - 24) list.scrollTop += 12;
+        clear();
+        for (const r of rows) {
+          const b = r.getBoundingClientRect();
+          if (ev.clientY < b.top || ev.clientY >= b.bottom || r.dataset.qi === undefined) continue;
+          const ti = Number(r.dataset.qi);
+          if (ti <= Q.idx) break;
+          const below = ev.clientY > b.top + b.height / 2;
+          r.classList.add(below ? 'dropBelow' : 'dropAbove');
+          target = below ? ti + 1 : ti;
+          break;
+        }
+      };
+      const up = () => {
+        grip.removeEventListener('pointermove', move);
+        grip.removeEventListener('pointerup', up);
+        grip.removeEventListener('pointercancel', up);
+        clear();
+        li.classList.remove('dragging');
+        let to = target;
+        if (to > index) to -= 1;
+        if (to !== index) queueMove(index, to);
+      };
+      grip.addEventListener('pointermove', move);
+      grip.addEventListener('pointerup', up);
+      grip.addEventListener('pointercancel', up);
+    });
+  }
+
+  function thumbFor(it) {
+    if (kindOf(it) === 'yt') return it.id ? thumb(it.id) : '';
+    const id = artCache[(it.channel || it.author || '') + ' - ' + it.title];
+    return id ? thumb(id) : '';
+  }
+
   function renderList() {
+    closeMenu();
     const ul = el('list');
     const empty = el('empty');
     ul.textContent = '';
     empty.textContent = '';
     const frag = document.createDocumentFragment();
+    const curKey = P.cur ? itemKey(currentAsItem() || {}) : '';
     if (listTab === 'folder') {
       el('folderPathLbl').textContent = F.path || S.folderPath || 'No folder chosen';
-      if (!helper.on) empty.innerHTML = 'Your music folder needs <b>Radiolock Helper</b> running on this PC.';
-      else if (F.missing) empty.textContent = "Music folder not found. Set the folder path in the Playback tab.";
+      if (!helper.on) empty.innerHTML = 'Your music folder needs <b>Radiolock</b> running on this PC.';
+      else if (F.missing) empty.textContent = 'Music folder not found. Click Choose folder.';
       else if (!F.loaded) empty.textContent = 'Loading your music folder...';
       else if (!F.files.length) empty.textContent = 'No songs in ' + (F.path || 'the folder') + '.';
       F.files.forEach((f, i) => {
-        const nm = splitName(f.name);
-        frag.append(itemRow({ title: nm.title, sub: nm.author, cur: i === F.idx, play: () => playFolderAt(i, true) }));
+        const it = folderItem(f);
+        frag.append(itemRow({ title: it.title, sub: it.channel, thumb: thumbFor(it), cur: itemKey(it) === curKey,
+          play: () => playFolderAt(i, true), menu: () => queueEntries(it).concat([favEntry(it)]) }));
       });
     } else if (listTab === 'results') {
       if (!results.length) empty.innerHTML = helper.on ? 'Search for a song, or paste a YouTube link.<br>Click a song to play it.' :
-        'Paste a YouTube link or playlist above.<br>Run <b>Radiolock Helper</b> for search and ad-free audio.';
+        'Paste a YouTube link or playlist above.<br>Run <b>Radiolock</b> for search and ad-free audio.';
       results.forEach((r) => {
-        frag.append(itemRow({ title: r.title, sub: r.channel, thumb: thumb(r.id), dur: r.duration, cur: P.cur && P.cur.id === r.id,
-          play: () => playYouTube(r, true), add: helper.on ? () => addToQueue(r) : null }));
+        const it = { kind: 'yt', id: r.id, title: r.title, channel: r.channel, duration: r.duration };
+        frag.append(itemRow({ title: r.title, sub: r.channel, thumb: thumb(r.id), dur: r.duration, cur: itemKey(it) === curKey,
+          play: () => playYouTube(it, true), menu: () => queueEntries(it).concat([favEntry(it)]) }));
+      });
+    } else if (listTab === 'favorites' || listTab === 'recent') {
+      const fav = listTab === 'favorites';
+      const src = fav ? LIB.fav : LIB.recent;
+      el('libCount').textContent = fav ? src.length + (src.length === 1 ? ' song' : ' songs') : '';
+      if (!helper.on) empty.innerHTML = (fav ? 'Favorites' : 'Recently played') + ' need <b>Radiolock</b> running on this PC.';
+      else if (!src.length) empty.textContent = fav ? 'No favorites yet. Use the heart, or the ... menu on any song.' : 'Songs you play show up here.';
+      const items = src.map(libToItem);
+      items.forEach((it, i) => {
+        const entries = () => fav
+          ? queueEntries(it).concat([{ label: 'Remove from favorites', fn: () => toggleFav(it, false) }])
+          : queueEntries(it).concat([favEntry(it)]);
+        frag.append(itemRow({ title: it.title, sub: it.channel, thumb: thumbFor(it), dur: it.duration, cur: itemKey(it) === curKey,
+          play: () => playList(items, i, false), menu: entries }));
       });
     } else {
       if (P.engine === 'embed') {
-        empty.textContent = 'Up next is handled by YouTube without the helper.';
+        empty.textContent = 'Up next is handled by YouTube without Radiolock running.';
+      } else if (!P.queueMode) {
+        empty.textContent = S.source === 'folder' ? 'Playing your folder. Use Play next on any song to start a queue.' :
+          'Nothing queued yet. Songs you play start a radio of similar music.';
       } else {
-        if (Q.idx < 0) empty.textContent = 'Nothing queued yet. Songs you play start a radio of similar music.';
         Q.items.slice(Math.max(0, Q.idx), Q.idx + 60).forEach((q, k) => {
           const i = Math.max(0, Q.idx) + k;
-          frag.append(itemRow({ title: q.title, sub: q.channel, thumb: thumb(q.id), dur: q.duration, cur: i === Q.idx, play: () => playQueueAt(i, true) }));
+          const isCur = i === Q.idx;
+          frag.append(itemRow({ title: q.title, sub: q.channel, thumb: thumbFor(q), dur: q.duration, cur: isCur, qi: i, drag: !isCur,
+            play: () => playQueueAt(i, true),
+            menu: () => isCur ? [favEntry(q)] : [
+              { label: 'Play now', fn: () => playQueueAt(i, true) },
+              { label: 'Move to top', fn: () => queueMove(i, Q.idx + 1) },
+              { label: 'Remove from queue', fn: () => queueRemove(i) },
+              favEntry(q)
+            ] }));
         });
       }
     }
@@ -731,6 +1039,9 @@
   document.querySelectorAll('.tab').forEach((t) => t.addEventListener('click', () => { listTab = t.dataset.list; renderTabs(); renderList(); }));
   el('btnPlay').addEventListener('click', () => { if (P.playing) pause(); else play(); });
   el('btnNext').addEventListener('click', () => next());
+  el('btnFav').addEventListener('click', () => toggleFav(currentAsItem()));
+  el('btnShuffleFav').addEventListener('click', () => playList(LIB.fav.map(libToItem), 0, true));
+  el('btnPlayFav').addEventListener('click', () => playList(LIB.fav.map(libToItem), 0, false));
   el('btnPrev').addEventListener('click', () => prev());
   el('artBox').parentElement.querySelector('.bar').addEventListener('click', (e) => {
     const r = e.currentTarget.getBoundingClientRect();
@@ -738,37 +1049,103 @@
     if (d > 0) seek(Math.max(0, Math.min(d - 3, (e.clientX - r.left) / r.width * d)));
   });
 
-  // ---------- visualizer ----------
-  let viz = null, vizTried = false;
-  function vizSetup() {
-    if (!S.visualizer || viz || vizTried || P.engine !== 'audio' || !P.activated) return;
-    vizTried = true;
+  // ---------- audio graph: visualizer, loudness leveling, volume ----------
+  // source -> meter (loudness) and viz (bars); source -> level gain -> volume gain -> speakers.
+  let graph = null, graphTried = false;
+  function graphSetup() {
+    if (graph || graphTried || P.engine !== 'audio' || !P.activated) return;
+    graphTried = true;
     try {
       const AC = window.AudioContext || window.webkitAudioContext;
       const ctx = new AC();
       ctx.resume().then(() => {
-        if (ctx.state !== 'running') { vizTried = false; ctx.close(); return; }
+        if (ctx.state !== 'running') { graphTried = false; ctx.close(); return; }
         const src = ctx.createMediaElementSource(audio);
-        const an = ctx.createAnalyser();
-        an.fftSize = 512; an.smoothingTimeConstant = 0.5; an.minDecibels = -100; an.maxDecibels = -20;
-        src.connect(an); an.connect(ctx.destination);
-        viz = { ctx: ctx, an: an, buf: new Uint8Array(an.frequencyBinCount), peak: [0, 0, 0, 0, 0] };
+        const meter = ctx.createAnalyser();
+        meter.fftSize = 2048;
+        const viz = ctx.createAnalyser();
+        viz.fftSize = 512; viz.smoothingTimeConstant = 0.5; viz.minDecibels = -100; viz.maxDecibels = -20;
+        const level = ctx.createGain();
+        const vol = ctx.createGain();
+        src.connect(meter);
+        src.connect(viz);
+        src.connect(level);
+        level.connect(vol);
+        vol.connect(ctx.destination);
+        graph = { ctx: ctx, meter: meter, viz: viz, level: level, vol: vol,
+          fbuf: new Float32Array(meter.fftSize), vbuf: new Uint8Array(viz.frequencyBinCount), peak: [0, 0, 0, 0, 0] };
+        applyVol();
+        applyLevel(true);
         send('viz', { ok: true });
-      }).catch((e) => { vizTried = false; log('visualizer: ' + e.name); });
-    } catch (e) { log('visualizer: ' + e.name); }
+      }).catch((e) => { graphTried = false; log('audio graph: ' + e.name); });
+    } catch (e) { log('audio graph: ' + e.name); }
   }
+
+  // Loudness leveling: measure each song's average level, then gain it toward a common target.
+  const LOUD_TARGET_DB = -18;
+  const LOUD_SAMPLES = 280;
+  const loudStore = load('rl_loud', {});
+  const meterState = { key: '', sum: 0, n: 0, done: false };
+
+  function meterReset() {
+    const key = P.cur ? itemKey(P.cur.kind === 'folder' ? P.cur : { kind: 'yt', id: P.cur.id }) : '';
+    meterState.key = key;
+    meterState.sum = 0;
+    meterState.n = 0;
+    meterState.done = key in loudStore;
+    applyLevel(true);
+  }
+
+  function levelDb() {
+    if (!S.levelLoud || P.engine !== 'audio' || !meterState.key) return 0;
+    if (meterState.key in loudStore) return loudStore[meterState.key];
+    if (meterState.n < 40) return 0;
+    return Math.max(-12, Math.min(9, LOUD_TARGET_DB - 10 * Math.log10(meterState.sum / meterState.n)));
+  }
+
+  function applyLevel(immediate) {
+    if (!graph) return;
+    const g = Math.pow(10, levelDb() / 20);
+    graph.level.gain.setTargetAtTime(g, graph.ctx.currentTime, immediate ? 0.01 : 1.5);
+  }
+
+  function meterTick() {
+    if (meterState.done || !S.levelLoud) return;
+    graph.meter.getFloatTimeDomainData(graph.fbuf);
+    let ms = 0;
+    for (let i = 0; i < graph.fbuf.length; i++) ms += graph.fbuf[i] * graph.fbuf[i];
+    ms /= graph.fbuf.length;
+    if (ms < 1e-5) return;
+    meterState.sum += ms;
+    meterState.n++;
+    if (meterState.n % 30 === 0) applyLevel(false);
+    if (meterState.n >= LOUD_SAMPLES) {
+      meterState.done = true;
+      loudStore[meterState.key] = Math.round(levelDb() * 10) / 10;
+      const keys = Object.keys(loudStore);
+      if (keys.length > 3000) delete loudStore[keys[0]];
+      save('rl_loud', loudStore);
+      applyLevel(false);
+    }
+  }
+
+  // Read-only hook for automated tests.
+  window.__rlVolume = () => (graph ? graph.vol.gain.value : audio.volume);
+
   const BANDS = [[1, 2], [3, 5], [6, 12], [13, 30], [31, 80]];
   setInterval(() => {
-    if (!viz || !S.visualizer || P.engine !== 'audio' || audio.paused) return;
-    if (viz.ctx.state !== 'running') { viz.ctx.resume().catch(() => {}); return; }
-    viz.an.getByteFrequencyData(viz.buf);
+    if (!graph || P.engine !== 'audio' || audio.paused) return;
+    if (graph.ctx.state !== 'running') { graph.ctx.resume().catch(() => {}); return; }
+    meterTick();
+    if (!S.visualizer) return;
+    graph.viz.getByteFrequencyData(graph.vbuf);
     let out = '';
     for (let i = 0; i < BANDS.length; i++) {
       let s = 0, c = 0;
-      for (let j = BANDS[i][0]; j <= BANDS[i][1]; j++) { s += viz.buf[j]; c++; }
+      for (let j = BANDS[i][0]; j <= BANDS[i][1]; j++) { s += graph.vbuf[j]; c++; }
       const avg = s / c;
-      viz.peak[i] = Math.max(avg, viz.peak[i] * 0.992);
-      out += viz.peak[i] < 8 ? 0 : Math.min(9, Math.floor(avg / viz.peak[i] * 9.4));
+      graph.peak[i] = Math.max(avg, graph.peak[i] * 0.992);
+      out += graph.peak[i] < 8 ? 0 : Math.min(9, Math.floor(avg / graph.peak[i] * 9.4));
     }
     send('v', { b: out });
   }, 70);
@@ -820,6 +1197,10 @@
       case 'source': switchSource(a); break;
       case 'rescan': if (S.source === 'folder') loadFolder(!P.cur); break;
       case 'pickFolder': pickFolder(); break;
+      case 'fav': toggleFav(currentAsItem()); break;
+      case 'hotkeySet': setHotkey(String(a), false); break;
+      case 'hotkeyClear': setHotkey(String(a), true); break;
+      case 'hotkeysGet': sendHotkeys(); break;
       case 'logs': writeGameLog(a); break;
       case 'zoom': document.documentElement.style.zoom = String(Number(a) || 1); break;
       case 'repaint':
@@ -839,13 +1220,14 @@
   }
 
   function applySettings(o) {
-    const before = { source: S.source, folderPath: S.folderPath, visualizer: S.visualizer, skipAds: S.skipAds };
+    const before = { source: S.source, folderPath: S.folderPath, visualizer: S.visualizer, skipAds: S.skipAds, levelLoud: S.levelLoud };
     Object.keys(o).forEach((k) => { S[k] = o[k]; });
     save('rl_settings', S);
     if (S.source !== before.source) switchSource(S.source);
     else if (S.source === 'folder' && S.folderPath !== before.folderPath) loadFolder(true);
     if (!S.skipAds && P.adMuted) { P.adMuted = false; applyVol(); }
-    if (S.visualizer && !before.visualizer) vizSetup();
+    if (S.visualizer && !before.visualizer) graphSetup();
+    if (S.levelLoud !== before.levelLoud) applyLevel(true);
     renderStatus();
   }
 

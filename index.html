@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Figtree:wght@500;600;700;800&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="app.css?v=3">
+<link rel="stylesheet" href="app.css?v=4">
 </head>
 <body>
 <div id="app">
@@ -30,6 +30,7 @@
       <div class="times"><span id="timeCur">0:00</span><span id="timeDur">0:00</span></div>
     </div>
     <div class="ctrls">
+      <button id="btnFav" class="ctrl fav" title="Favorite" hidden><svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 3 4.5 6.7 4.5c2.1 0 3.6 1.2 4.3 2.4h2c.7-1.2 2.2-2.4 4.3-2.4 3.7 0 5.8 3.9 4.3 7.3C19.5 16.4 12 21 12 21z"/></svg></button>
       <button id="btnPrev" class="ctrl" title="Previous">&#9198;</button>
       <button id="btnPlay" class="ctrl play" title="Play">&#9654;</button>
       <button id="btnNext" class="ctrl" title="Next">&#9197;</button>
@@ -40,7 +41,14 @@
     <button data-list="results" class="tab on">Results</button>
     <button data-list="queue" class="tab">Up next</button>
     <button data-list="folder" class="tab">Folder</button>
+    <button data-list="favorites" class="tab">Favorites</button>
+    <button data-list="recent" class="tab">Recent</button>
   </nav>
+  <div id="libBar" class="folderBar" hidden>
+    <span id="libCount" class="folderPath"></span>
+    <button id="btnPlayFav" type="button" class="ghost">Play all</button>
+    <button id="btnShuffleFav" type="button">Shuffle favorites</button>
+  </div>
   <div id="folderBar" class="folderBar" hidden>
     <span id="folderPathLbl" class="folderPath"></span>
     <button id="pickBtn" type="button">Choose folder</button>
@@ -48,7 +56,8 @@
   <ul id="list" class="list"></ul>
   <div id="empty" class="empty"></div>
 </div>
+<div id="menu" class="menu" hidden></div>
 <audio id="audio" crossorigin="anonymous" preload="auto"></audio>
-<script src="app.js?v=3"></script>
+<script src="app.js?v=4"></script>
 </body>
 </html>
