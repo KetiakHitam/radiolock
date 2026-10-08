@@ -113,4 +113,4 @@ html, body {
 .empty:empty { display: none; }
 .empty b { color: var(--accent); }
 
-html.dlmrp body { outline: 1px solid transparent; }
+#px { position: fixed; right: 0; bottom: 0; width: 1px; height: 1px; background: #141311; pointer-events: none; }
