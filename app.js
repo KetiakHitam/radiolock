@@ -3,7 +3,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.4.0';
+  const VERSION = '1.6.0';
   const HELPER = 'http://127.0.0.1:47800';
   const SID = Math.random().toString(36).slice(2, 10);
   const YT_ID = /^[A-Za-z0-9_-]{11}$/;
@@ -47,7 +47,7 @@
 
   const S = Object.assign({
     source: 'youtube', folderPath: '', skipAds: true, visualizer: true, shuffle: true,
-    rememberSong: false, onlineArt: true, levelLoud: true, browserZoom: 0
+    rememberSong: false, onlineArt: true, levelLoud2: false, browserZoom: 0, repeat: 'off'
   }, load('rl_settings', {}));
 
   // ---------- helper ----------
@@ -76,7 +76,7 @@
     if (first || helper.on !== was) {
       send('helper', { on: helper.on, status: helper.info ? helper.info.status : '' });
       log('helper ' + (helper.on ? 'connected' : 'not running'));
-      if (helper.on) { connectEvents(); loadLib(); sendHotkeys(); } else { disconnectEvents(); send('hotkeys', { helper: false }); }
+      if (helper.on) { connectEvents(); loadLib(); sendHotkeys(); loadPlaylists(); } else { disconnectEvents(); send('hotkeys', { helper: false }); }
       if (!first) onHelperChange();
     }
     renderStatus();
@@ -94,7 +94,8 @@
     pendingPlay: false,
     errors: 0
   };
-  const Q = { items: [], idx: -1, mixFor: '' };          // YouTube queue (helper mode)
+  // fixed: a playlist or other chosen list, no radio after it. pid: the saved playlist being played.
+  const Q = { items: [], idx: -1, mixFor: '', fixed: false, pid: '', shuffled: false };
   const F = { files: [], path: '', idx: -1, recent: [], missing: false, loaded: false };
   let results = [];
   let listTab = 'results';
@@ -138,7 +139,11 @@
   // ---------- audio engine (helper YouTube and folder) ----------
   audio.addEventListener('playing', () => { P.playing = true; P.errors = 0; send('play'); renderNow(); graphSetup(); noteRecent(); });
   audio.addEventListener('pause', () => { if (P.engine !== 'audio') return; P.playing = false; send('pause'); renderNow(); });
-  audio.addEventListener('ended', () => { if (P.engine === 'audio') next(); });
+  audio.addEventListener('ended', () => {
+    if (P.engine !== 'audio') return;
+    if (S.repeat === 'one') { seek(0); tryPlay(); return; }
+    next();
+  });
   audio.addEventListener('error', () => {
     if (P.engine !== 'audio' || !audio.getAttribute('src')) return;
     P.errors++;
@@ -243,7 +248,10 @@
     if (P.engine !== 'embed') return;
     if (st === 1) { P.playing = true; P.errors = 0; send('play'); embedMeta(); noteRecent(); }
     else if (st === 2) { P.playing = false; send('pause'); }
-    else if (st === 0) { P.playing = false; send('pause'); }
+    else if (st === 0) {
+      if (S.repeat === 'one') { embed.player.seekTo(0, true); embed.player.playVideo(); return; }
+      P.playing = false; send('pause');
+    }
     else if (st === 5 || st === -1) embedMeta();
     renderNow();
   }
@@ -372,13 +380,19 @@
     afterTrackChange();
   }
 
-  function playList(items, start, shuffle) {
+  function shuffled(items) {
+    const list = items.slice();
+    for (let i = list.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const t = list[i]; list[i] = list[j]; list[j] = t; }
+    return list;
+  }
+
+  function playList(items, start, shuffle, pid) {
     if (!items.length) return;
     let list = items.slice();
-    if (shuffle) {
-      for (let i = list.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const t = list[i]; list[i] = list[j]; list[j] = t; }
-      start = 0;
-    }
+    if (shuffle) { list = shuffled(list); start = 0; }
+    Q.fixed = true;
+    Q.pid = pid || '';
+    Q.shuffled = !!shuffle;
     if (!helper.on) {
       const yt = list.filter((x) => kindOf(x) === 'yt');
       if (!yt.length) { setNotice('Folder songs need Radiolock running.'); return; }
@@ -394,7 +408,7 @@
 
   async function extendWithMix() {
     const seed = P.cur && P.cur.kind === 'yt' ? P.cur.id : '';
-    if (!seed || Q.mixFor === seed || !helper.on) return;
+    if (!seed || Q.fixed || Q.mixFor === seed || !helper.on) return;
     Q.mixFor = seed;
     try {
       const j = await hget('/yt/list?mix=' + seed, 30000);
@@ -414,6 +428,8 @@
       Q.items = [item];
       Q.idx = -1;
       Q.mixFor = '';
+      Q.fixed = false;
+      Q.pid = '';
       playQueueAt(0, autoplay, at);
     } else {
       setCurrent({ kind: 'yt', id: item.id, title: item.title || 'Loading...', author: item.channel || '', duration: item.duration || 0 });
@@ -546,6 +562,17 @@
     if (P.engine === 'embed') { try { embed.player.nextVideo(); } catch (e) { log('embed next: ' + e.message); } return; }
     if (!P.queueMode && S.source === 'folder') { folderNext(); return; }
     if (Q.idx + 1 < Q.items.length) { playQueueAt(Q.idx + 1, true); return; }
+    // End of a playlist or chosen list: loop it with Repeat, otherwise stop. No radio.
+    if (Q.fixed) {
+      if (S.repeat === 'all' && Q.items.length) {
+        if (Q.shuffled) Q.items = shuffled(Q.items);
+        playQueueAt(0, true);
+      } else {
+        pause();
+        setNotice('End of the list. Turn on Repeat to loop it.');
+      }
+      return;
+    }
     // End of the queue: keep a radio going for YouTube songs, otherwise fall back to the folder.
     if (P.cur && P.cur.kind === 'yt') { extendWithMix().then(() => { if (Q.idx + 1 < Q.items.length) playQueueAt(Q.idx + 1, true); }); return; }
     if (S.source === 'folder' && F.files.length) { P.queueMode = false; folderNext(); }
@@ -695,14 +722,13 @@
     if (l.list && helper.on) {
       setNotice('Loading playlist...');
       try {
-        const j = await hget('/yt/list?url=' + encodeURIComponent(l.url), 60000);
-        if (!j.ok || !j.items.length) { setNotice("Couldn't open that playlist."); return; }
-        Q.items = j.items; Q.mixFor = '';
-        const start = l.id ? Math.max(0, j.items.findIndex((x) => x.id === l.id)) : 0;
-        setNotice('Playlist: ' + j.items.length + ' songs.');
-        listTab = 'queue';
-        renderTabs();
-        playQueueAt(start, true);
+        const j = await hget('/yt/list?url=' + encodeURIComponent(l.url), 180000);
+        if (!j.ok || !j.items.length) { setNotice("Couldn't open that playlist. Private playlists can't be read."); return; }
+        const items = j.items.map((x) => ({ kind: 'yt', id: x.id, title: x.title, channel: x.channel, duration: x.duration }));
+        const pid = await savePlaylist({ src: l.list, name: j.title || 'YouTube playlist', items: items });
+        const start = l.id ? Math.max(0, items.findIndex((x) => x.id === l.id)) : 0;
+        setNotice('Saved to Playlists: ' + (j.title || 'YouTube playlist') + ' (' + items.length + ' songs).');
+        playList(items, start, false, pid);
       } catch (e) { setNotice("Couldn't open that playlist."); log('playlist failed: ' + e.message); }
       return;
     }
@@ -751,6 +777,8 @@
     const folder = S.source === 'folder';
     el('folderBar').hidden = listTab !== 'folder';
     el('libBar').hidden = listTab !== 'favorites';
+    el('plBar').hidden = listTab !== 'playlists';
+    renderPlBar();
     el('folderPathLbl').textContent = F.path || S.folderPath || 'No folder chosen';
     document.querySelectorAll('.tab').forEach((t) => {
       const name = t.dataset.list;
@@ -857,6 +885,196 @@
     } catch (e) { log('hotkey change failed: ' + e.message); }
   }
 
+  // ---------- playlists (Radiolock's own copies, stored by the helper) ----------
+  const PL = { list: [], open: null, shown: 200, renaming: false };
+
+  async function loadPlaylists() {
+    if (!helper.on) return;
+    try {
+      const j = await hget('/pl', 8000);
+      if (j.ok) PL.list = j.playlists;
+      if (listTab === 'playlists') renderList();
+    } catch (e) { log('playlists load failed: ' + e.message); }
+  }
+
+  async function openPlaylist(pid) {
+    try {
+      const j = await hget('/pl/get?pid=' + encodeURIComponent(pid), 8000);
+      if (!j.ok) { setNotice("Couldn't open that playlist."); return; }
+      PL.open = j.playlist;
+      PL.shown = 200;
+      listTab = 'playlists';
+      renderTabs();
+      renderList();
+    } catch (e) { log('playlist open failed: ' + e.message); }
+  }
+
+  // Saves a whole playlist. Same YouTube source replaces the old copy. Returns the playlist id.
+  async function savePlaylist(p) {
+    if (!helper.on) { setNotice('Playlists need Radiolock running.'); return ''; }
+    const body = { playlist: { pid: p.pid || '', src: p.src || '', name: p.name, items: p.items.map(libItemFor) } };
+    try {
+      const j = await hpost('/pl/put', body);
+      if (!j.ok) { setNotice(j.error || "Couldn't save the playlist."); return ''; }
+      await loadPlaylists();
+      if (PL.open && PL.open.pid === j.pid) {
+        const g = await hget('/pl/get?pid=' + j.pid, 8000);
+        if (g.ok) PL.open = g.playlist;
+        if (listTab === 'playlists') { renderPlBar(); renderList(); }
+      }
+      return j.pid;
+    } catch (e) { log('playlist save failed: ' + e.message); setNotice("Couldn't save the playlist."); return ''; }
+  }
+
+  async function addToPlaylist(it, pid) {
+    try {
+      const g = await hget('/pl/get?pid=' + encodeURIComponent(pid), 8000);
+      if (!g.ok) return;
+      const p = g.playlist;
+      const items = p.items.map(libToItem);
+      if (items.some((x) => itemKey(x) === itemKey(it))) { setNotice('Already in ' + p.name + '.'); return; }
+      if (items.length >= 2000) { setNotice(p.name + ' is full (2000 songs).'); return; }
+      items.push(it);
+      await savePlaylist({ pid: p.pid, src: p.src, name: p.name, items: items });
+      setNotice('Added to ' + p.name + '.');
+    } catch (e) { log('add to playlist failed: ' + e.message); }
+  }
+
+  async function newPlaylist(items) {
+    const name = 'Playlist ' + (PL.list.length + 1);
+    const pid = await savePlaylist({ name: name, items: items });
+    if (!pid) return;
+    setNotice('Created ' + name + '.');
+    await openPlaylist(pid);
+    startRename();
+  }
+
+  function plEntry(it, anchor) {
+    return { label: 'Add to playlist...', fn: () => {
+      const entries = PL.list.map((p) => ({ label: p.name, fn: () => addToPlaylist(it, p.pid) }));
+      entries.push({ label: '+ New playlist', fn: () => newPlaylist([it]) });
+      setTimeout(() => openMenu(anchor, entries), 0);
+    } };
+  }
+
+  async function editOpen(fn) {
+    if (!PL.open) return;
+    const items = PL.open.items.map(libToItem);
+    fn(items);
+    await savePlaylist({ pid: PL.open.pid, src: PL.open.src, name: PL.open.name, items: items });
+  }
+
+  async function syncPlaylist(p) {
+    if (!p.src) return;
+    setNotice('Syncing ' + p.name + ' from YouTube...');
+    try {
+      const j = await hget('/yt/list?url=' + encodeURIComponent('https://www.youtube.com/playlist?list=' + p.src), 180000);
+      if (!j.ok || !j.items.length) { setNotice("Couldn't read that playlist from YouTube."); return; }
+      const items = j.items.map((x) => ({ kind: 'yt', id: x.id, title: x.title, channel: x.channel, duration: x.duration }));
+      await savePlaylist({ pid: p.pid, src: p.src, name: p.name, items: items });
+      setNotice(p.name + ' synced: ' + items.length + ' songs.');
+    } catch (e) { log('playlist sync failed: ' + e.message); }
+  }
+
+  function playlistMenu(p, anchor) {
+    const entries = [
+      { label: 'Play', fn: () => playList(p.items.map(libToItem), 0, false, p.pid) },
+      { label: 'Shuffle', fn: () => playList(p.items.map(libToItem), 0, true, p.pid) },
+      { label: 'Rename', fn: () => { if (PL.open && PL.open.pid === p.pid) startRename(); else openPlaylist(p.pid).then(startRename); } }
+    ];
+    if (p.src) entries.push({ label: 'Sync from YouTube', fn: () => syncPlaylist(p) });
+    entries.push({ label: 'Delete playlist', fn: () => setTimeout(() => openMenu(anchor, [
+      { label: 'Yes, delete "' + p.name + '"', fn: () => deletePlaylist(p.pid) },
+      { label: 'Cancel', fn: () => {} }
+    ]), 0) });
+    return entries;
+  }
+
+  async function deletePlaylist(pid) {
+    try {
+      await hpost('/pl/delete', { pid: pid });
+      if (PL.open && PL.open.pid === pid) PL.open = null;
+      if (Q.pid === pid) Q.pid = '';
+      await loadPlaylists();
+      renderTabs();
+      renderList();
+      setNotice('Playlist deleted.');
+    } catch (e) { log('playlist delete failed: ' + e.message); }
+  }
+
+  function startRename() {
+    if (!PL.open) return;
+    PL.renaming = true;
+    renderPlBar();
+    const inp = el('plNameInput');
+    inp.value = PL.open.name;
+    inp.focus();
+    inp.select();
+  }
+
+  function finishRename(keep) {
+    if (!PL.renaming) return;
+    PL.renaming = false;
+    const name = el('plNameInput').value.trim().slice(0, 80);
+    const changed = keep && PL.open && name && name !== PL.open.name;
+    if (changed) PL.open.name = name;
+    renderPlBar();
+    if (changed) editOpen(() => {});
+  }
+
+  function renderPlBar() {
+    const open = !!PL.open;
+    el('plBack').hidden = !open;
+    el('plPlay').hidden = !open;
+    el('plShuffle').hidden = !open;
+    el('plMore').hidden = !open;
+    el('plNew').hidden = open;
+    el('plNameInput').hidden = !(open && PL.renaming);
+    el('plTitle').hidden = open && PL.renaming;
+    el('plTitle').textContent = open ? PL.open.name + '  -  ' + PL.open.items.length + ' songs' :
+      PL.list.length + (PL.list.length === 1 ? ' playlist' : ' playlists');
+  }
+
+  function renderPlaylists(frag, empty, curKey) {
+    if (!helper.on) { empty.innerHTML = 'Playlists need <b>Radiolock</b> running on this PC.'; return; }
+    if (!PL.open) {
+      if (!PL.list.length) empty.innerHTML = 'Paste a YouTube playlist link in the search box and it is saved here.<br>Or use Add to playlist in any song\'s ... menu.';
+      PL.list.forEach((p) => {
+        frag.append(itemRow({ title: p.name, sub: p.count + (p.count === 1 ? ' song' : ' songs') + (Q.pid === p.pid ? '  -  playing' : ''),
+          thumb: p.cover ? thumb(p.cover) : '', cur: Q.pid === p.pid, play: () => openPlaylist(p.pid),
+          menu: (b) => playlistMenu(p, b) }));
+      });
+      return;
+    }
+    const p = PL.open;
+    const items = p.items.map(libToItem);
+    if (!items.length) empty.textContent = 'This playlist is empty. Use Add to playlist in any song\'s ... menu.';
+    items.slice(0, PL.shown).forEach((it, i) => {
+      frag.append(itemRow({ title: it.title, sub: it.channel, thumb: thumbFor(it), dur: it.duration, cur: itemKey(it) === curKey, qi: i,
+        drag: { min: 0, move: (from, to) => editOpen((list) => { const [x] = list.splice(from, 1); list.splice(to, 0, x); }) },
+        play: () => playList(items, i, false, p.pid),
+        menu: (b) => queueEntries(it).concat([
+          favEntry(it),
+          { label: 'Remove from this playlist', fn: () => editOpen((list) => { list.splice(i, 1); }) },
+          plEntry(it, b)
+        ]) }));
+    });
+    if (items.length > PL.shown) {
+      const more = document.createElement('li');
+      more.className = 'item more-row';
+      more.textContent = 'Show more (' + (items.length - PL.shown) + ' left)';
+      more.addEventListener('click', () => { PL.shown += 200; renderList(); });
+      frag.append(more);
+    }
+  }
+
+  function renderRepeat() {
+    const b = el('btnRepeat');
+    b.classList.toggle('on', S.repeat !== 'off');
+    b.classList.toggle('one', S.repeat === 'one');
+    b.title = S.repeat === 'off' ? 'Repeat: off' : (S.repeat === 'all' ? 'Repeat: playlist' : 'Repeat: this song');
+  }
+
   // ---------- row menu ----------
   const menuEl = el('menu');
   function closeMenu() { menuEl.hidden = true; }
@@ -899,7 +1117,7 @@
       grip.className = 'grip';
       grip.title = 'Drag to move';
       li.append(grip);
-      enableDrag(li, grip, o.qi);
+      enableDrag(li, grip, o.qi, o.drag);
     }
     const th = document.createElement('div');
     th.className = 'thumb' + (o.thumb ? '' : ' note');
@@ -917,7 +1135,7 @@
       b.className = 'more';
       b.title = 'More';
       for (let i = 0; i < 3; i++) b.append(document.createElement('i'));
-      b.addEventListener('click', (e) => { e.stopPropagation(); openMenu(b, o.menu()); });
+      b.addEventListener('click', (e) => { e.stopPropagation(); openMenu(b, o.menu(b)); });
       li.append(b);
     }
     li.addEventListener('click', o.play);
@@ -925,7 +1143,7 @@
   }
 
   // Drag a queue row by its grip to a new position.
-  function enableDrag(li, grip, index) {
+  function enableDrag(li, grip, index, opts) {
     grip.addEventListener('click', (e) => e.stopPropagation());
     grip.addEventListener('pointerdown', (e) => {
       e.preventDefault();
@@ -946,7 +1164,7 @@
           const b = r.getBoundingClientRect();
           if (ev.clientY < b.top || ev.clientY >= b.bottom || r.dataset.qi === undefined) continue;
           const ti = Number(r.dataset.qi);
-          if (ti <= Q.idx) break;
+          if (ti < opts.min) break;
           const below = ev.clientY > b.top + b.height / 2;
           r.classList.add(below ? 'dropBelow' : 'dropAbove');
           target = below ? ti + 1 : ti;
@@ -961,7 +1179,7 @@
         li.classList.remove('dragging');
         let to = target;
         if (to > index) to -= 1;
-        if (to !== index) queueMove(index, to);
+        if (to !== index) opts.move(index, to);
       };
       grip.addEventListener('pointermove', move);
       grip.addEventListener('pointerup', up);
@@ -992,7 +1210,7 @@
       F.files.forEach((f, i) => {
         const it = folderItem(f);
         frag.append(itemRow({ title: it.title, sub: it.channel, thumb: thumbFor(it), cur: itemKey(it) === curKey,
-          play: () => playFolderAt(i, true), menu: () => queueEntries(it).concat([favEntry(it)]) }));
+          play: () => playFolderAt(i, true), menu: (b) => queueEntries(it).concat([favEntry(it), plEntry(it, b)]) }));
       });
     } else if (listTab === 'results') {
       if (!results.length) empty.innerHTML = helper.on ? 'Search for a song, or paste a YouTube link.<br>Click a song to play it.' :
@@ -1000,7 +1218,7 @@
       results.forEach((r) => {
         const it = { kind: 'yt', id: r.id, title: r.title, channel: r.channel, duration: r.duration };
         frag.append(itemRow({ title: r.title, sub: r.channel, thumb: thumb(r.id), dur: r.duration, cur: itemKey(it) === curKey,
-          play: () => playYouTube(it, true), menu: () => queueEntries(it).concat([favEntry(it)]) }));
+          play: () => playYouTube(it, true), menu: (b) => queueEntries(it).concat([favEntry(it), plEntry(it, b)]) }));
       });
     } else if (listTab === 'favorites' || listTab === 'recent') {
       const fav = listTab === 'favorites';
@@ -1010,12 +1228,14 @@
       else if (!src.length) empty.textContent = fav ? 'No favorites yet. Use the heart, or the ... menu on any song.' : 'Songs you play show up here.';
       const items = src.map(libToItem);
       items.forEach((it, i) => {
-        const entries = () => fav
-          ? queueEntries(it).concat([{ label: 'Remove from favorites', fn: () => toggleFav(it, false) }])
-          : queueEntries(it).concat([favEntry(it)]);
+        const entries = (b) => fav
+          ? queueEntries(it).concat([{ label: 'Remove from favorites', fn: () => toggleFav(it, false) }, plEntry(it, b)])
+          : queueEntries(it).concat([favEntry(it), plEntry(it, b)]);
         frag.append(itemRow({ title: it.title, sub: it.channel, thumb: thumbFor(it), dur: it.duration, cur: itemKey(it) === curKey,
           play: () => playList(items, i, false), menu: entries }));
       });
+    } else if (listTab === 'playlists') {
+      renderPlaylists(frag, empty, curKey);
     } else {
       if (P.engine === 'embed') {
         empty.textContent = 'Up next is handled by YouTube without Radiolock running.';
@@ -1026,13 +1246,15 @@
         Q.items.slice(Math.max(0, Q.idx), Q.idx + 60).forEach((q, k) => {
           const i = Math.max(0, Q.idx) + k;
           const isCur = i === Q.idx;
-          frag.append(itemRow({ title: q.title, sub: q.channel, thumb: thumbFor(q), dur: q.duration, cur: isCur, qi: i, drag: !isCur,
+          frag.append(itemRow({ title: q.title, sub: q.channel, thumb: thumbFor(q), dur: q.duration, cur: isCur, qi: i,
+            drag: isCur ? null : { min: Q.idx + 1, move: queueMove },
             play: () => playQueueAt(i, true),
-            menu: () => isCur ? [favEntry(q)] : [
+            menu: (b) => isCur ? [favEntry(q), plEntry(q, b)] : [
               { label: 'Play now', fn: () => playQueueAt(i, true) },
               { label: 'Move to top', fn: () => queueMove(i, Q.idx + 1) },
               { label: 'Remove from queue', fn: () => queueRemove(i) },
-              favEntry(q)
+              favEntry(q),
+              plEntry(q, b)
             ] }));
         });
       }
@@ -1046,6 +1268,22 @@
   el('btnFav').addEventListener('click', () => toggleFav(currentAsItem()));
   el('btnShuffleFav').addEventListener('click', () => playList(LIB.fav.map(libToItem), 0, true));
   el('btnPlayFav').addEventListener('click', () => playList(LIB.fav.map(libToItem), 0, false));
+  el('btnRepeat').addEventListener('click', () => {
+    S.repeat = S.repeat === 'off' ? 'all' : (S.repeat === 'all' ? 'one' : 'off');
+    save('rl_settings', S);
+    renderRepeat();
+    setNotice(S.repeat === 'off' ? 'Repeat off.' : (S.repeat === 'all' ? 'Repeat the playlist.' : 'Repeat this song.'));
+  });
+  el('plBack').addEventListener('click', () => { PL.open = null; renderTabs(); renderList(); });
+  el('plPlay').addEventListener('click', () => { if (PL.open) playList(PL.open.items.map(libToItem), 0, false, PL.open.pid); });
+  el('plShuffle').addEventListener('click', () => { if (PL.open) playList(PL.open.items.map(libToItem), 0, true, PL.open.pid); });
+  el('plMore').addEventListener('click', (e) => { e.stopPropagation(); if (PL.open) openMenu(el('plMore'), playlistMenu(PL.open, el('plMore'))); });
+  el('plNew').addEventListener('click', () => newPlaylist([]));
+  el('plNameInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.keyCode === 13) { e.preventDefault(); finishRename(true); }
+    else if (e.key === 'Escape') finishRename(false);
+  });
+  el('plNameInput').addEventListener('blur', () => finishRename(true));
   el('btnPrev').addEventListener('click', () => prev());
   el('artBox').parentElement.querySelector('.bar').addEventListener('click', (e) => {
     const r = e.currentTarget.getBoundingClientRect();
@@ -1101,7 +1339,7 @@
   }
 
   function levelDb() {
-    if (!S.levelLoud || P.engine !== 'audio' || !meterState.key) return 0;
+    if (!S.levelLoud2 || P.engine !== 'audio' || !meterState.key) return 0;
     if (meterState.key in loudStore) return loudStore[meterState.key];
     if (meterState.n < 40) return 0;
     return Math.max(-12, Math.min(9, LOUD_TARGET_DB - 10 * Math.log10(meterState.sum / meterState.n)));
@@ -1114,7 +1352,7 @@
   }
 
   function meterTick() {
-    if (meterState.done || !S.levelLoud) return;
+    if (meterState.done || !S.levelLoud2) return;
     graph.meter.getFloatTimeDomainData(graph.fbuf);
     let ms = 0;
     for (let i = 0; i < graph.fbuf.length; i++) ms += graph.fbuf[i] * graph.fbuf[i];
@@ -1369,14 +1607,14 @@
   }
 
   function applySettings(o) {
-    const before = { source: S.source, folderPath: S.folderPath, visualizer: S.visualizer, skipAds: S.skipAds, levelLoud: S.levelLoud };
+    const before = { source: S.source, folderPath: S.folderPath, visualizer: S.visualizer, skipAds: S.skipAds, levelLoud2: S.levelLoud2 };
     Object.keys(o).forEach((k) => { S[k] = o[k]; });
     save('rl_settings', S);
     if (S.source !== before.source) switchSource(S.source);
     else if (S.source === 'folder' && S.folderPath !== before.folderPath) loadFolder(true);
     if (!S.skipAds && P.adMuted) { P.adMuted = false; applyVol(); }
     if (S.visualizer && !before.visualizer) graphSetup();
-    if (S.levelLoud !== before.levelLoud) applyLevel(true);
+    if (S.levelLoud2 !== before.levelLoud2) applyLevel(true);
     renderStatus();
   }
 
@@ -1387,6 +1625,7 @@
   renderNow();
   renderList();
   renderStatus();
+  renderRepeat();
   send('hello', { version: VERSION, saved: load('rl_settings', null) });
   listTab = S.source === 'folder' ? 'folder' : 'results';
   renderTabs();

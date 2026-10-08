@@ -8,7 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Figtree:wght@500;600;700;800&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="app.css?v=6">
+<link rel="stylesheet" href="app.css?v=8">
 </head>
 <body>
 <div id="app">
@@ -35,6 +35,7 @@
       <button id="btnPrev" class="ctrl" title="Previous">&#9198;</button>
       <button id="btnPlay" class="ctrl play" title="Play">&#9654;</button>
       <button id="btnNext" class="ctrl" title="Next">&#9197;</button>
+      <button id="btnRepeat" class="ctrl repeat" title="Repeat: off"><svg viewBox="0 0 24 24" width="17" height="17"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg><span class="one">1</span></button>
     </div>
   </section>
 
@@ -44,7 +45,17 @@
     <button data-list="folder" class="tab">Folder</button>
     <button data-list="favorites" class="tab">Favorites</button>
     <button data-list="recent" class="tab">Recent</button>
+    <button data-list="playlists" class="tab">Playlists</button>
   </nav>
+  <div id="plBar" class="folderBar" hidden>
+    <button id="plBack" type="button" class="ghost">Back</button>
+    <span id="plTitle" class="folderPath plTitle"></span>
+    <input id="plNameInput" class="plName" type="text" maxlength="80" spellcheck="false" hidden>
+    <button id="plPlay" type="button">Play</button>
+    <button id="plShuffle" type="button" class="ghost">Shuffle</button>
+    <button id="plMore" type="button" class="ghost">...</button>
+    <button id="plNew" type="button" class="ghost">New playlist</button>
+  </div>
   <div id="libBar" class="folderBar" hidden>
     <span id="libCount" class="folderPath"></span>
     <button id="btnPlayFav" type="button" class="ghost">Play all</button>
@@ -59,6 +70,6 @@
 </div>
 <div id="menu" class="menu" hidden></div>
 <audio id="audio" crossorigin="anonymous" preload="auto"></audio>
-<script src="app.js?v=6"></script>
+<script src="app.js?v=8"></script>
 </body>
 </html>

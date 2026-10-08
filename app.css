@@ -114,3 +114,13 @@ html, body {
 .empty b { color: var(--accent); }
 
 html.dlmrp body { outline: 1px solid transparent; }
+
+.ctrl.repeat { position: relative; }
+.ctrl.repeat svg { fill: var(--dim); }
+.ctrl.repeat.on svg { fill: var(--accent); }
+.ctrl.repeat .one { display: none; position: absolute; right: 5px; bottom: 4px; font-size: 9px; font-weight: 800; color: var(--accent); }
+.ctrl.repeat.one .one { display: block; }
+.folderBar button[hidden], .folderBar input[hidden], .folderBar span[hidden] { display: none; }
+.plTitle { direction: ltr; color: var(--text); font-weight: 800; font-size: 13px; }
+.plName { flex: 1; min-width: 0; height: 30px; padding: 0 10px; background: var(--panel); color: var(--text); border: 1px solid var(--accent); border-radius: 6px; font: inherit; outline: none; user-select: text; }
+.item.more-row { justify-content: center; color: var(--accent); font-weight: 800; }
