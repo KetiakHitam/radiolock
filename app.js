@@ -1352,7 +1352,10 @@
       case 'hotkeysGet': sendHotkeys(); break;
       case 'logs': writeGameLog(a); break;
       case 'zoom': document.documentElement.style.zoom = String(Number(a) || 1); break;
-      case 'repaint': forcePaint(); break;
+      case 'repaint':
+        document.documentElement.classList.toggle('dlmrp');
+        window.dispatchEvent(new Event('resize'));
+        break;
       default: log('unknown command ' + cmd);
     }
   }
@@ -1363,17 +1366,6 @@
     const body = lines.map((l) => String(l).slice(0, 500)).join('\n');
     fetch(HELPER + '/log', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: body, cache: 'no-store' })
       .catch((e) => { console.warn('game log write failed', e); });
-  }
-
-  // The game shows this page from frames the browser sends only when something changes.
-  // After the Music tab is hidden and shown again, nothing has changed, so the panel stays blank.
-  // Shifting one corner pixel by one shade is invisible but counts as a change.
-  let paintFlip = false;
-  function forcePaint() {
-    const px = el('px');
-    paintFlip = !paintFlip;
-    px.style.backgroundColor = paintFlip ? '#151412' : '#141311';
-    requestAnimationFrame(() => { px.style.opacity = paintFlip ? '0.99' : '1'; });
   }
 
   function applySettings(o) {
