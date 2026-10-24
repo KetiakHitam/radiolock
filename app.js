@@ -15,7 +15,7 @@
   let flushing = false;
 
   function send(t, d, urgent) {
-    const msg = JSON.stringify({ t: t, n: ++outN, sid: SID, d: d || {} });
+    const msg = { t: t, d: d || {} };
     if (urgent) outQ.unshift(msg); else outQ.push(msg);
     if (outQ.length > 80) outQ.splice(40, outQ.length - 80);
     if (!flushing) flush();
@@ -23,8 +23,22 @@
   function flush() {
     if (!outQ.length) { flushing = false; return; }
     flushing = true;
-    document.title = outQ.shift();
+    const m = outQ.shift();
+    // The game drops any number not above the last one, so numbering happens here, in send order.
+    document.title = JSON.stringify({ t: m.t, n: ++outN, sid: SID, d: m.d });
     setTimeout(flush, 20);
+  }
+  let crumbFailed = false;
+  function crumb(step) {
+    try {
+      const c = JSON.parse(localStorage.getItem('rl_crumb') || '{}');
+      if (c.sid !== SID) { c.sid = SID; c.step = ''; c.stepAt = 0; }
+      if (step) { c.step = step; c.stepAt = Date.now(); }
+      c.beatAt = Date.now();
+      localStorage.setItem('rl_crumb', JSON.stringify(c));
+    } catch (e) {
+      if (!crumbFailed) { crumbFailed = true; console.warn('crumb write failed', e); }
+    }
   }
   const pageLogQ = [];
   function log(msg) {
@@ -1112,6 +1126,7 @@
   function crossfade(i, sec) {
     if (MOOD.fade) { clearInterval(MOOD.fade); MOOD.fade = null; }
     const o = 1 - i;
+    crumb('crossfade to deck ' + i + (decks[o].paused ? '' : ', both playing'));
     const th0 = Math.asin(Math.max(0, Math.min(1, deckLv[i])));
     const ms = Math.max(0, Number(sec) || 0) * 1000 * (1 - th0 / (Math.PI / 2));
     const t0 = Date.now();
@@ -1124,6 +1139,7 @@
       if (k < 1) return false;
       if (MOOD.fade) { clearInterval(MOOD.fade); MOOD.fade = null; }
       decks[o].pause();
+      crumb('crossfade done');
       return true;
     };
     if (!step()) MOOD.fade = setInterval(step, 30);
@@ -1173,10 +1189,15 @@
     const fresher = name === 'calm' || Date.now() - MOOD.fightEnd <= (Number(S.moodResumeSec) || 0) * 1000;
     const resume = !!(s.cur && d.getAttribute('src') && fresher);
     log('mood ' + name + (resume ? ', resume' : ', next song') + (wasPlaying ? ', still sounding' : ''));
+    crumb('mood ' + name + (resume ? ' resume' : ' next') + ' deck ' + s.deck);
     if (resume) {
       setCurrent(s.cur);
       renderList();
       if (autoplay) tryPlay();
+    } else if (s.restore) {
+      const r = s.restore;
+      s.restore = null;
+      playQueueAt(r.idx, autoplay, r.at);
     } else {
       let i = s.idx + 1;
       if (i >= s.items.length) { i = 0; if (s.shuffle) { s.items = shuffled(s.items); Q.items = s.items; } }
@@ -1202,6 +1223,19 @@
     renderMood();
   }
 
+  // Saved every 2 s so a page restart picks up the same songs at the same spot.
+  function moodPersist() {
+    const pos = (name) => {
+      const s = MOOD.slots[name];
+      if (!s) return null;
+      const idx = MOOD.mood === name ? Q.idx : s.idx;
+      const items = MOOD.mood === name ? Q.items : s.items;
+      const it = items[idx];
+      return it ? { key: itemKey(it), at: Math.floor(decks[s.deck].currentTime || 0) } : null;
+    };
+    save('rl_mood', { at: Date.now(), playing: P.playing, mood: MOOD.mood, fightEnd: MOOD.fightEnd, calm: pos('calm'), fight: pos('fight') });
+  }
+
   async function moodStart(autoplay) {
     if (!helper.on) { setNotice('Mood mode needs Radiolock running.'); return false; }
     if (!S.moodCalm || !S.moodFight) { setNotice('Pick a calm and a fight playlist first.'); return false; }
@@ -1218,6 +1252,19 @@
     };
     MOOD.slots.calm = mk(c, !!S.moodCalmShuffle);
     MOOD.slots.fight = mk(f, !!S.moodFightShuffle);
+    // Recent saved state means the page restarted mid-game: continue from it.
+    const saved = load('rl_mood', null);
+    if (saved && Date.now() - saved.at < 30000) {
+      ['calm', 'fight'].forEach((name) => {
+        const s = MOOD.slots[name], sp = saved[name];
+        const i = sp ? s.items.findIndex((x) => itemKey(x) === sp.key) : -1;
+        if (i >= 0) { s.idx = i; s.restore = { idx: i, at: sp.at }; }
+      });
+      MOOD.fightEnd = saved.fightEnd || 0;
+      if (saved.playing) autoplay = true;
+      if (!MOOD.heard) MOOD.want = saved.mood === 'fight' ? 'fight' : 'calm';
+      log('mood restored after a page restart (' + saved.mood + ', ' + (saved.playing ? 'playing' : 'paused') + ')');
+    }
     // If a song is playing, the first mood takes the idle deck so the switch from it is a crossfade too.
     const busy = P.engine === 'audio' && P.playing;
     if (P.engine !== 'audio') useEngine('audio');
@@ -1227,8 +1274,9 @@
     MOOD.slots[otherMood(first)].deck = busy ? cur : 1 - cur;
     MOOD.on = true;
     MOOD.mood = first;
-    MOOD.fightEnd = 0;
+    if (!(saved && Date.now() - saved.at < 30000)) MOOD.fightEnd = 0;
     moodGo(first, autoplay || busy, true);
+    moodPersist();
     return true;
   }
 
@@ -1246,6 +1294,7 @@
     applyDecks();
     S.moodOn = false;
     save('rl_settings', S);
+    save('rl_mood', null);
     sendMood();
     renderMood();
     if (msg) setNotice(msg);
@@ -1651,6 +1700,8 @@
   let beat = 0;
   setInterval(() => {
     beat++;
+    crumb('');
+    if (MOOD.on && beat % 4 === 0) moodPersist();
     const t = curTime(), d = curDur();
     el('barFill').style.width = d > 0 ? Math.min(100, t / d * 100) + '%' : '0%';
     el('timeCur').textContent = fmt(t);
@@ -1837,6 +1888,7 @@
         break;
       case 'peer': onPeerCmd(a); break;
       case 'mood':
+        MOOD.heard = true;
         MOOD.want = a === 'fight' ? 'fight' : 'calm';
         if (MOOD.on && P.playing) moodGo(MOOD.want, true);
         renderMood();
@@ -1881,6 +1933,19 @@
   window.addEventListener('hashchange', onHash);
 
   // ---------- boot ----------
+  // A previous page that never said goodbye ended abruptly: log its last step for debugging.
+  try {
+    const c = JSON.parse(localStorage.getItem('rl_crumb') || 'null');
+    if (c && c.sid && !c.closed && Date.now() - (c.beatAt || 0) < 120000) {
+      log('previous page ended unexpectedly ' + Math.round((Date.now() - c.beatAt) / 100) / 10 + 's ago, ' +
+        (c.step ? Math.round((c.beatAt - c.stepAt) / 100) / 10 + 's after: ' + c.step : 'no step recorded'));
+    }
+  } catch (e) { log('crumb read failed: ' + e.message); }
+  crumb('boot');
+  window.addEventListener('pagehide', () => {
+    try { const c = JSON.parse(localStorage.getItem('rl_crumb') || '{}'); c.closed = true; localStorage.setItem('rl_crumb', JSON.stringify(c)); }
+    catch (e) { console.warn('crumb close failed', e); }
+  });
   renderTabs();
   renderNow();
   renderList();
