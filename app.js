@@ -1856,7 +1856,8 @@
   // ---------- game to page ----------
   let lastSeq = 0;
   function onHash() {
-    const m = /^#s=(\d+)&c=(.*)$/.exec(location.hash);
+    // r is the game's retry count, only there so a resent URL never matches the current one.
+    const m = /^#s=(\d+)(?:&r=\d+)?&c=(.*)$/.exec(location.hash);
     if (!m) return;
     const seq = Number(m[1]);
     send('ack', { s: seq }, true);
