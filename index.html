@@ -8,7 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Figtree:wght@500;600;700;800&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="app.css?v=8">
+<link rel="stylesheet" href="app.css?v=9">
 </head>
 <body>
 <div id="app">
@@ -56,6 +56,14 @@
     <button id="plMore" type="button" class="ghost">...</button>
     <button id="plNew" type="button" class="ghost">New playlist</button>
   </div>
+  <div id="moodBar" class="moodBar" hidden>
+    <button id="moodToggle" type="button" class="moodToggle">Mood mode: off</button>
+    <button id="moodCalm" type="button" class="moodPick">Calm: Pick a playlist</button>
+    <button id="moodCalmShuf" type="button" class="moodShuf" title="Shuffle the calm playlist">Shuffle</button>
+    <button id="moodFight" type="button" class="moodPick">Fight: Pick a playlist</button>
+    <button id="moodFightShuf" type="button" class="moodShuf" title="Shuffle the fight playlist">Shuffle</button>
+    <span id="moodNow" class="moodNow"></span>
+  </div>
   <div id="libBar" class="folderBar" hidden>
     <span id="libCount" class="folderPath"></span>
     <button id="btnPlayFav" type="button" class="ghost">Play all</button>
@@ -70,6 +78,7 @@
 </div>
 <div id="menu" class="menu" hidden></div>
 <audio id="audio" crossorigin="anonymous" preload="auto"></audio>
-<script src="app.js?v=8"></script>
+<audio id="audio2" crossorigin="anonymous" preload="auto"></audio>
+<script src="app.js?v=9"></script>
 </body>
 </html>

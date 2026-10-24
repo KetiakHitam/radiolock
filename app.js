@@ -3,7 +3,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.6.0';
+  const VERSION = '1.7.0';
   const HELPER = 'http://127.0.0.1:47800';
   const SID = Math.random().toString(36).slice(2, 10);
   const YT_ID = /^[A-Za-z0-9_-]{11}$/;
@@ -47,7 +47,8 @@
 
   const S = Object.assign({
     source: 'youtube', folderPath: '', skipAds: true, visualizer: true, shuffle: true,
-    rememberSong: false, onlineArt: true, levelLoud2: false, browserZoom: 0, repeat: 'off'
+    rememberSong: false, onlineArt: true, levelLoud2: false, browserZoom: 0, repeat: 'off',
+    moodOn: false, moodCalm: '', moodFight: '', moodCalmShuffle: false, moodFightShuffle: false, moodXfadeSec: 2, moodResumeSec: 90
   }, load('rl_settings', {}));
 
   // ---------- helper ----------
@@ -99,7 +100,10 @@
   const F = { files: [], path: '', idx: -1, recent: [], missing: false, loaded: false };
   let results = [];
   let listTab = 'results';
-  const audio = el('audio');
+  // Two audio decks for Mood mode crossfades. audio is the active deck, deckLv the crossfade level of each.
+  const decks = [el('audio'), el('audio2')];
+  let audio = decks[0];
+  const deckLv = [1, 0];
 
   function fmt(sec) {
     sec = Math.max(0, Math.floor(sec || 0));
@@ -118,13 +122,18 @@
   function applyVol() {
     const v = P.adMuted ? 0 : Math.max(0, Math.min(100, P.vol));
     // With the audio graph, the element stays at full volume so loudness can be measured; the gain node sets volume.
-    if (graph) { audio.volume = 1; graph.vol.gain.setTargetAtTime(v / 100, graph.ctx.currentTime, 0.02); }
-    else audio.volume = v / 100;
+    if (graph) { decks.forEach((d) => { d.volume = 1; }); graph.vol.gain.setTargetAtTime(v / 100, graph.ctx.currentTime, 0.02); }
+    applyDecks();
     if (embed.player && embed.ready) {
       try { if (P.adMuted) embed.player.mute(); else { embed.player.unMute(); embed.player.setVolume(Math.round(v)); } } catch (e) { log('embed volume: ' + e.message); }
     }
   }
   function setVol(v) { P.vol = Number(v) || 0; applyVol(); }
+  function applyDecks() {
+    if (graph) { graph.deck.forEach((g, i) => g.gain.setTargetAtTime(deckLv[i], graph.ctx.currentTime, 0.015)); return; }
+    const v = P.adMuted ? 0 : Math.max(0, Math.min(100, P.vol)) / 100;
+    decks.forEach((d, i) => { d.volume = v * deckLv[i]; });
+  }
   function fadeTo(to, sec) {
     if (fadeTimer) { clearInterval(fadeTimer); fadeTimer = null; }
     const from = P.vol, ms = (Number(sec) || 0) * 1000, t0 = Date.now();
@@ -137,14 +146,15 @@
   }
 
   // ---------- audio engine (helper YouTube and folder) ----------
-  audio.addEventListener('playing', () => { P.playing = true; P.errors = 0; send('play'); renderNow(); graphSetup(); noteRecent(); });
-  audio.addEventListener('pause', () => { if (P.engine !== 'audio') return; P.playing = false; send('pause'); renderNow(); });
-  audio.addEventListener('ended', () => {
+  function onDeck(name, fn) { decks.forEach((d) => d.addEventListener(name, (e) => { if (e.target === audio) fn(e); })); }
+  onDeck('playing', () => { P.playing = true; P.errors = 0; send('play'); renderNow(); graphSetup(); noteRecent(); });
+  onDeck('pause', () => { if (P.engine !== 'audio') return; P.playing = false; send('pause'); renderNow(); });
+  onDeck('ended', () => {
     if (P.engine !== 'audio') return;
     if (S.repeat === 'one') { seek(0); tryPlay(); return; }
     next();
   });
-  audio.addEventListener('error', () => {
+  onDeck('error', () => {
     if (P.engine !== 'audio' || !audio.getAttribute('src')) return;
     P.errors++;
     const name = P.cur ? P.cur.title : 'song';
@@ -164,7 +174,7 @@
     }
   }
   function pause() {
-    if (P.engine === 'audio') audio.pause();
+    if (P.engine === 'audio') { moodSnap(); decks.forEach((d) => d.pause()); }
     else if (P.engine === 'embed' && embed.player && embed.ready) embed.player.pauseVideo();
   }
   function curTime() {
@@ -185,7 +195,7 @@
 
   function useEngine(name) {
     if (P.engine === name) return;
-    if (P.engine === 'audio') { audio.pause(); audio.removeAttribute('src'); audio.load(); }
+    if (P.engine === 'audio') decks.forEach((d) => { d.pause(); d.removeAttribute('src'); d.load(); });
     if (P.engine === 'embed' && embed.player && embed.ready) { try { embed.player.stopVideo(); } catch (e) { log('embed stop: ' + e.message); } }
     P.engine = name;
     P.playing = false;
@@ -197,8 +207,9 @@
     audio.src = src;
     applyVol();
     if (at > 0) {
-      const once = () => { audio.removeEventListener('loadedmetadata', once); try { audio.currentTime = at; } catch (e) { log('resume seek: ' + e.name); } };
-      audio.addEventListener('loadedmetadata', once);
+      const d = audio;
+      const once = () => { d.removeEventListener('loadedmetadata', once); try { d.currentTime = at; } catch (e) { log('resume seek: ' + e.name); } };
+      d.addEventListener('loadedmetadata', once);
     }
     if (autoplay) tryPlay(); else audio.load();
   }
@@ -388,6 +399,7 @@
 
   function playList(items, start, shuffle, pid) {
     if (!items.length) return;
+    moodStop('Mood mode is off because you picked a song.');
     let list = items.slice();
     if (shuffle) { list = shuffled(list); start = 0; }
     Q.fixed = true;
@@ -424,6 +436,7 @@
   }
 
   function playYouTube(item, autoplay, at) {
+    moodStop('Mood mode is off because you picked a song.');
     if (helper.on) {
       Q.items = [item];
       Q.idx = -1;
@@ -481,6 +494,7 @@
 
   function playFolderAt(i, autoplay, at) {
     if (!F.files.length) return;
+    moodStop('Mood mode is off because you picked a song.');
     i = ((i % F.files.length) + F.files.length) % F.files.length;
     if (F.idx >= 0 && F.idx !== i) { F.recent.push(F.idx); if (F.recent.length > 100) F.recent.shift(); }
     F.idx = i;
@@ -564,7 +578,7 @@
     if (Q.idx + 1 < Q.items.length) { playQueueAt(Q.idx + 1, true); return; }
     // End of a playlist or chosen list: loop it with Repeat, otherwise stop. No radio.
     if (Q.fixed) {
-      if (S.repeat === 'all' && Q.items.length) {
+      if ((S.repeat === 'all' || MOOD.on) && Q.items.length) {
         if (Q.shuffled) Q.items = shuffled(Q.items);
         playQueueAt(0, true);
       } else {
@@ -584,6 +598,7 @@
     if (Q.idx > 0) playQueueAt(Q.idx - 1, true); else seek(0);
   }
   function play() {
+    if (MOOD.on && MOOD.want !== MOOD.mood) { moodGo(MOOD.want, true); return; }
     if (P.engine === 'none') {
       if (S.source === 'folder' && F.files.length) { playFolderAt(F.idx >= 0 ? F.idx : 0, true); return; }
       const last = load('rl_last', null);
@@ -609,6 +624,7 @@
 
   // ---------- source switching ----------
   function switchSource(src) {
+    moodStop('Mood mode is off because the music source changed.');
     S.source = src === 'folder' ? 'folder' : 'youtube';
     useEngine('none');
     P.cur = null;
@@ -779,6 +795,7 @@
     el('libBar').hidden = listTab !== 'favorites';
     el('plBar').hidden = listTab !== 'playlists';
     renderPlBar();
+    renderMood();
     el('folderPathLbl').textContent = F.path || S.folderPath || 'No folder chosen';
     document.querySelectorAll('.tab').forEach((t) => {
       const name = t.dataset.list;
@@ -893,6 +910,7 @@
     try {
       const j = await hget('/pl', 8000);
       if (j.ok) PL.list = j.playlists;
+      renderMood();
       if (listTab === 'playlists') renderList();
     } catch (e) { log('playlists load failed: ' + e.message); }
   }
@@ -917,6 +935,7 @@
       const j = await hpost('/pl/put', body);
       if (!j.ok) { setNotice(j.error || "Couldn't save the playlist."); return ''; }
       await loadPlaylists();
+      moodRefresh(j.pid);
       if (PL.open && PL.open.pid === j.pid) {
         const g = await hget('/pl/get?pid=' + j.pid, 8000);
         if (g.ok) PL.open = g.playlist;
@@ -995,6 +1014,12 @@
       await hpost('/pl/delete', { pid: pid });
       if (PL.open && PL.open.pid === pid) PL.open = null;
       if (Q.pid === pid) Q.pid = '';
+      if (S.moodCalm === pid || S.moodFight === pid) {
+        moodStop('Mood mode is off because its playlist was deleted.');
+        if (S.moodCalm === pid) S.moodCalm = '';
+        if (S.moodFight === pid) S.moodFight = '';
+        save('rl_settings', S);
+      }
       await loadPlaylists();
       renderTabs();
       renderList();
@@ -1040,7 +1065,8 @@
     if (!PL.open) {
       if (!PL.list.length) empty.innerHTML = 'Paste a YouTube playlist link in the search box and it is saved here.<br>Or use Add to playlist in any song\'s ... menu.';
       PL.list.forEach((p) => {
-        frag.append(itemRow({ title: p.name, sub: p.count + (p.count === 1 ? ' song' : ' songs') + (Q.pid === p.pid ? '  -  playing' : ''),
+        const tag = (S.moodCalm === p.pid ? '  -  calm' : '') + (S.moodFight === p.pid ? '  -  fight' : '');
+        frag.append(itemRow({ title: p.name, sub: p.count + (p.count === 1 ? ' song' : ' songs') + tag + (Q.pid === p.pid ? '  -  playing' : ''),
           thumb: p.cover ? thumb(p.cover) : '', cur: Q.pid === p.pid, play: () => openPlaylist(p.pid),
           menu: (b) => playlistMenu(p, b) }));
       });
@@ -1074,6 +1100,229 @@
     b.classList.toggle('one', S.repeat === 'one');
     b.title = S.repeat === 'off' ? 'Repeat: off' : (S.repeat === 'all' ? 'Repeat: playlist' : 'Repeat: this song');
   }
+
+  // ---------- mood mode: calm and fight playlists, crossfaded on the game's combat state ----------
+  // Each mood owns one deck. The idle deck keeps its song paused so the calm song resumes where it left off.
+  const MOOD = { on: false, mood: 'calm', want: 'calm', slots: { calm: null, fight: null }, fightEnd: 0, gen: 0, fade: null };
+
+  function otherMood(m) { return m === 'calm' ? 'fight' : 'calm'; }
+  function sendMood() { send('mood', { on: MOOD.on, mood: MOOD.mood }, true); }
+
+  // Equal-power crossfade toward deck i, starting from the current levels so a reversed fade stays smooth.
+  function crossfade(i, sec) {
+    if (MOOD.fade) { clearInterval(MOOD.fade); MOOD.fade = null; }
+    const o = 1 - i;
+    const th0 = Math.asin(Math.max(0, Math.min(1, deckLv[i])));
+    const ms = Math.max(0, Number(sec) || 0) * 1000 * (1 - th0 / (Math.PI / 2));
+    const t0 = Date.now();
+    const step = () => {
+      const k = ms > 0 ? Math.min(1, (Date.now() - t0) / ms) : 1;
+      const th = th0 + (Math.PI / 2 - th0) * k;
+      deckLv[i] = k >= 1 ? 1 : Math.sin(th);
+      deckLv[o] = k >= 1 ? 0 : Math.cos(th);
+      applyDecks();
+      if (k < 1) return false;
+      if (MOOD.fade) { clearInterval(MOOD.fade); MOOD.fade = null; }
+      decks[o].pause();
+      return true;
+    };
+    if (!step()) MOOD.fade = setInterval(step, 30);
+  }
+
+  // Ends a running fade at once: the active deck at full, the other paused.
+  function moodSnap() {
+    if (!MOOD.fade) return;
+    clearInterval(MOOD.fade);
+    MOOD.fade = null;
+    const a = decks.indexOf(audio);
+    deckLv[a] = 1; deckLv[1 - a] = 0;
+    applyDecks();
+    decks[1 - a].pause();
+  }
+
+  function moodSave() {
+    const s = MOOD.slots[MOOD.mood];
+    if (!s) return;
+    s.items = Q.items; s.idx = Q.idx; s.cur = P.cur;
+  }
+  function moodLoadQ(s) {
+    Q.items = s.items; Q.idx = s.idx; Q.mixFor = ''; Q.fixed = true; Q.pid = s.pid; Q.shuffled = s.shuffle;
+    P.queueMode = true;
+  }
+  function moodPrefetch(s) {
+    const nx = s.items[(s.idx + 1) % s.items.length];
+    if (nx && kindOf(nx) === 'yt') hget('/yt/prefetch?id=' + nx.id, 5000).catch((e) => log('mood prefetch: ' + e.message));
+  }
+
+  // Switch to a mood: resume its paused song or load its next one, then crossfade in once it plays.
+  function moodGo(name, autoplay, fresh) {
+    if (!MOOD.on) return;
+    if (!fresh) {
+      if (MOOD.mood === name) return;
+      moodSave();
+      if (MOOD.mood === 'fight') MOOD.fightEnd = Date.now();
+    }
+    const gen = ++MOOD.gen;
+    const outDeck = decks.indexOf(audio);
+    const s = MOOD.slots[name];
+    const d = decks[s.deck];
+    MOOD.mood = name;
+    audio = d;
+    moodLoadQ(s);
+    const wasPlaying = !d.paused;
+    const fresher = name === 'calm' || Date.now() - MOOD.fightEnd <= (Number(S.moodResumeSec) || 0) * 1000;
+    const resume = !!(s.cur && d.getAttribute('src') && fresher);
+    log('mood ' + name + (resume ? ', resume' : ', next song') + (wasPlaying ? ', still sounding' : ''));
+    if (resume) {
+      setCurrent(s.cur);
+      renderList();
+      if (autoplay) tryPlay();
+    } else {
+      let i = s.idx + 1;
+      if (i >= s.items.length) { i = 0; if (s.shuffle) { s.items = shuffled(s.items); Q.items = s.items; } }
+      playQueueAt(i, autoplay);
+    }
+    if (!autoplay || s.deck === outDeck) {
+      if (MOOD.fade) { clearInterval(MOOD.fade); MOOD.fade = null; }
+      deckLv[s.deck] = 1; deckLv[1 - s.deck] = 0;
+      applyDecks();
+      if (s.deck !== outDeck) decks[outDeck].pause();
+    } else if (wasPlaying) {
+      // Still sounding from a fade that was cut short: fade straight back.
+      crossfade(s.deck, S.moodXfadeSec);
+    } else {
+      const go = () => { if (gen === MOOD.gen) crossfade(s.deck, S.moodXfadeSec); };
+      const once = () => { d.removeEventListener('playing', once); go(); };
+      d.addEventListener('playing', once);
+      // A song that never starts still lets the old one fade out.
+      setTimeout(() => { d.removeEventListener('playing', once); if (gen === MOOD.gen && deckLv[s.deck] < 1 && !MOOD.fade) go(); }, 15000);
+    }
+    moodPrefetch(MOOD.slots[otherMood(name)]);
+    sendMood();
+    renderMood();
+  }
+
+  async function moodStart(autoplay) {
+    if (!helper.on) { setNotice('Mood mode needs Radiolock running.'); return false; }
+    if (!S.moodCalm || !S.moodFight) { setNotice('Pick a calm and a fight playlist first.'); return false; }
+    let c, f;
+    try {
+      const get = async (pid) => { const j = await hget('/pl/get?pid=' + encodeURIComponent(pid), 8000); return j.ok ? j.playlist : null; };
+      [c, f] = await Promise.all([get(S.moodCalm), get(S.moodFight)]);
+    } catch (e) { log('mood load failed: ' + e.message); setNotice("Couldn't load the mood playlists."); return false; }
+    if (!c || !f) { setNotice('A mood playlist is missing. Pick it again.'); return false; }
+    if (!c.items.length || !f.items.length) { setNotice('Both mood playlists need at least one song.'); return false; }
+    const mk = (p, shuffle) => {
+      const orig = p.items.map(libToItem);
+      return { pid: p.pid, orig: orig, items: shuffle ? shuffled(orig) : orig.slice(), idx: -1, shuffle: shuffle, cur: null, deck: 0 };
+    };
+    MOOD.slots.calm = mk(c, !!S.moodCalmShuffle);
+    MOOD.slots.fight = mk(f, !!S.moodFightShuffle);
+    // If a song is playing, the first mood takes the idle deck so the switch from it is a crossfade too.
+    const busy = P.engine === 'audio' && P.playing;
+    if (P.engine !== 'audio') useEngine('audio');
+    const cur = decks.indexOf(audio);
+    const first = MOOD.want;
+    MOOD.slots[first].deck = busy ? 1 - cur : cur;
+    MOOD.slots[otherMood(first)].deck = busy ? cur : 1 - cur;
+    MOOD.on = true;
+    MOOD.mood = first;
+    MOOD.fightEnd = 0;
+    moodGo(first, autoplay || busy, true);
+    return true;
+  }
+
+  // Turns Mood mode off. The current song keeps playing as a normal playlist.
+  function moodStop(msg) {
+    if (!MOOD.on) return;
+    log('mood off' + (msg ? ': ' + msg : ''));
+    MOOD.on = false;
+    MOOD.gen++;
+    if (MOOD.fade) { clearInterval(MOOD.fade); MOOD.fade = null; }
+    const a = decks.indexOf(audio), o = 1 - a;
+    decks[o].pause();
+    if (decks[o].getAttribute('src')) { decks[o].removeAttribute('src'); decks[o].load(); }
+    deckLv[a] = 1; deckLv[o] = 0;
+    applyDecks();
+    S.moodOn = false;
+    save('rl_settings', S);
+    sendMood();
+    renderMood();
+    if (msg) setNotice(msg);
+  }
+
+  // A mood playlist was edited: take the new song list, keep the current song and position.
+  async function moodRefresh(pid) {
+    if (!MOOD.on) return;
+    for (const name of ['calm', 'fight']) {
+      const s = MOOD.slots[name];
+      if (!s || s.pid !== pid) continue;
+      try {
+        const j = await hget('/pl/get?pid=' + encodeURIComponent(pid), 8000);
+        if (!j.ok || !j.playlist.items.length) continue;
+        if (MOOD.mood === name) moodSave();
+        const cur = s.items[s.idx];
+        s.orig = j.playlist.items.map(libToItem);
+        const rest = cur ? s.orig.filter((x) => itemKey(x) !== itemKey(cur)) : s.orig.slice();
+        if (s.shuffle) { s.items = cur ? [cur].concat(shuffled(rest)) : shuffled(rest); s.idx = cur ? 0 : -1; }
+        else { s.items = s.orig.slice(); s.idx = cur ? s.items.findIndex((x) => itemKey(x) === itemKey(cur)) : -1; if (cur && s.idx < 0) { s.items.unshift(cur); s.idx = 0; } }
+        if (MOOD.mood === name) { moodLoadQ(s); renderList(); }
+      } catch (e) { log('mood refresh failed: ' + e.message); }
+    }
+  }
+
+  function moodSetShuffle(name, on) {
+    S[name === 'calm' ? 'moodCalmShuffle' : 'moodFightShuffle'] = on;
+    save('rl_settings', S);
+    const s = MOOD.on ? MOOD.slots[name] : null;
+    if (s) {
+      if (MOOD.mood === name) moodSave();
+      const cur = s.items[s.idx];
+      s.shuffle = on;
+      if (on) { const rest = cur ? s.orig.filter((x) => itemKey(x) !== itemKey(cur)) : s.orig; s.items = cur ? [cur].concat(shuffled(rest)) : shuffled(rest); s.idx = cur ? 0 : -1; }
+      else { s.items = s.orig.slice(); s.idx = cur ? s.items.findIndex((x) => itemKey(x) === itemKey(cur)) : -1; if (cur && s.idx < 0) { s.items.unshift(cur); s.idx = 0; } }
+      if (MOOD.mood === name) { moodLoadQ(s); renderList(); }
+    }
+    renderMood();
+  }
+
+  function moodPick(name, anchor) {
+    const key = name === 'calm' ? 'moodCalm' : 'moodFight';
+    const entries = PL.list.map((p) => ({ label: (S[key] === p.pid ? '> ' : '') + p.name, fn: async () => {
+      S[key] = p.pid;
+      save('rl_settings', S);
+      renderMood();
+      renderList();
+      if (MOOD.on) { moodStop(''); S.moodOn = true; save('rl_settings', S); if (!(await moodStart(true))) { S.moodOn = false; save('rl_settings', S); } renderMood(); }
+    } }));
+    if (!entries.length) { setNotice('Make a playlist first: paste a YouTube playlist link, or use Add to playlist on any song.'); return; }
+    openMenu(anchor, entries);
+  }
+
+  function renderMood() {
+    el('moodBar').hidden = !(listTab === 'playlists' && !PL.open && helper.on);
+    const name = (pid) => { const p = PL.list.find((x) => x.pid === pid); return p ? p.name : 'Pick a playlist'; };
+    const tg = el('moodToggle');
+    tg.textContent = MOOD.on ? 'Mood mode: on' : 'Mood mode: off';
+    tg.classList.toggle('on', MOOD.on);
+    el('moodCalm').textContent = 'Calm: ' + name(S.moodCalm);
+    el('moodFight').textContent = 'Fight: ' + name(S.moodFight);
+    el('moodCalmShuf').classList.toggle('on', !!S.moodCalmShuffle);
+    el('moodFightShuf').classList.toggle('on', !!S.moodFightShuffle);
+    el('moodNow').textContent = MOOD.on ? (MOOD.mood === 'fight' ? 'Fight now' : 'Calm now') : '';
+  }
+
+  el('moodToggle').addEventListener('click', async () => {
+    if (MOOD.on) { moodStop('Mood mode off.'); return; }
+    S.moodOn = true;
+    save('rl_settings', S);
+    if (!(await moodStart(true))) { S.moodOn = false; save('rl_settings', S); }
+    renderMood();
+  });
+  el('moodCalm').addEventListener('click', (e) => { e.stopPropagation(); moodPick('calm', el('moodCalm')); });
+  el('moodFight').addEventListener('click', (e) => { e.stopPropagation(); moodPick('fight', el('moodFight')); });
+  el('moodCalmShuf').addEventListener('click', () => moodSetShuffle('calm', !S.moodCalmShuffle));
+  el('moodFightShuf').addEventListener('click', () => moodSetShuffle('fight', !S.moodFightShuffle));
 
   // ---------- row menu ----------
   const menuEl = el('menu');
@@ -1302,19 +1551,24 @@
       const ctx = new AC();
       ctx.resume().then(() => {
         if (ctx.state !== 'running') { graphTried = false; ctx.close(); return; }
-        const src = ctx.createMediaElementSource(audio);
         const meter = ctx.createAnalyser();
         meter.fftSize = 2048;
         const viz = ctx.createAnalyser();
         viz.fftSize = 512; viz.smoothingTimeConstant = 0.5; viz.minDecibels = -100; viz.maxDecibels = -20;
         const level = ctx.createGain();
         const vol = ctx.createGain();
-        src.connect(meter);
-        src.connect(viz);
-        src.connect(level);
+        const deck = decks.map((d, i) => {
+          const g = ctx.createGain();
+          g.gain.value = deckLv[i];
+          ctx.createMediaElementSource(d).connect(g);
+          g.connect(meter);
+          g.connect(viz);
+          g.connect(level);
+          return g;
+        });
         level.connect(vol);
         vol.connect(ctx.destination);
-        graph = { ctx: ctx, meter: meter, viz: viz, level: level, vol: vol,
+        graph = { ctx: ctx, meter: meter, viz: viz, level: level, vol: vol, deck: deck,
           fbuf: new Float32Array(meter.fftSize), vbuf: new Uint8Array(viz.frequencyBinCount), peak: [0, 0, 0, 0, 0] };
         applyVol();
         applyLevel(true);
@@ -1373,6 +1627,7 @@
 
   // Read-only hook for automated tests.
   window.__rlVolume = () => (graph ? graph.vol.gain.value : audio.volume);
+  window.__rlDecks = () => ({ lv: deckLv.slice(), active: decks.indexOf(audio), paused: decks.map((d) => d.paused), t: decks.map((d) => d.currentTime), src: decks.map((d) => d.getAttribute('src') || ''), mood: MOOD.mood, on: MOOD.on, q: outQ.length, n: outN });
 
   const BANDS = [[1, 2], [3, 5], [6, 12], [13, 30], [31, 80]];
   setInterval(() => {
@@ -1402,7 +1657,7 @@
     el('timeDur').textContent = fmt(d);
     if (P.playing) send('tick', { cur: t, dur: d, id: P.cur && P.cur.kind === 'yt' ? P.cur.id : '' });
     else if (beat % 3 === 0) send('st', { playing: false });
-    if (beat % 4 === 0) send('hb', {});
+    if (beat % 4 === 0) send('hb', { mood: MOOD.on });
     if (P.playing && S.rememberSong && beat % 10 === 0 && P.cur) {
       save('rl_last', { kind: P.cur.kind, id: P.cur.id || '', rel: P.cur.rel || '', title: P.cur.title, author: P.cur.author, duration: d, t: Math.floor(t) });
     }
@@ -1581,6 +1836,11 @@
         }
         break;
       case 'peer': onPeerCmd(a); break;
+      case 'mood':
+        MOOD.want = a === 'fight' ? 'fight' : 'calm';
+        if (MOOD.on && P.playing) moodGo(MOOD.want, true);
+        renderMood();
+        break;
       case 'source': switchSource(a); break;
       case 'rescan': if (S.source === 'folder') loadFolder(!P.cur); break;
       case 'pickFolder': pickFolder(); break;
@@ -1629,7 +1889,9 @@
   send('hello', { version: VERSION, saved: load('rl_settings', null) });
   listTab = S.source === 'folder' ? 'folder' : 'results';
   renderTabs();
-  checkHelper().then(() => {
+  checkHelper().then(async () => {
+    if (S.moodOn && helper.on && await moodStart(false)) { if (S.source === 'folder') loadFolder(false); renderList(); return; }
+    if (S.moodOn) { S.moodOn = false; save('rl_settings', S); renderMood(); }
     if (S.source === 'folder') loadFolder(true);
     else maybeResumeYouTube();
     renderList();
