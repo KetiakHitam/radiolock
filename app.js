@@ -434,11 +434,14 @@
 
   async function extendWithMix() {
     const seed = P.cur && P.cur.kind === 'yt' ? P.cur.id : '';
-    if (!seed || Q.fixed || Q.mixFor === seed || !helper.on) return;
+    if (!seed || Q.fixed || MOOD.on || Q.mixFor === seed || !helper.on) return;
     Q.mixFor = seed;
+    const forItems = Q.items;
     try {
       const j = await hget('/yt/list?mix=' + seed, 30000);
       if (!j.ok) return;
+      // The mix takes seconds. Drop it if a playlist or Mood mode replaced the queue meanwhile.
+      if (Q.items !== forItems || Q.fixed || MOOD.on) { log('mix dropped, queue changed while loading'); return; }
       const have = new Set(Q.items.map((x) => x.id));
       const add = j.items.filter((x) => !have.has(x.id) && (!x.duration || x.duration < 900));
       Q.items = Q.items.concat(add.slice(0, 40));
