@@ -3,7 +3,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.7.0';
+  const VERSION = '1.7.3';
   const HELPER = 'http://127.0.0.1:47800';
   const SID = Math.random().toString(36).slice(2, 10);
   const YT_ID = /^[A-Za-z0-9_-]{11}$/;
@@ -161,7 +161,7 @@
 
   // ---------- audio engine (helper YouTube and folder) ----------
   function onDeck(name, fn) { decks.forEach((d) => d.addEventListener(name, (e) => { if (e.target === audio) fn(e); })); }
-  onDeck('playing', () => { P.playing = true; P.errors = 0; send('play'); renderNow(); graphSetup(); noteRecent(); });
+  onDeck('playing', () => { loadingEnd(); P.playing = true; P.errors = 0; send('play'); renderNow(); graphSetup(); noteRecent(); });
   onDeck('pause', () => { if (P.engine !== 'audio') return; P.playing = false; send('pause'); renderNow(); });
   onDeck('ended', () => {
     if (P.engine !== 'audio') return;
@@ -170,6 +170,7 @@
   });
   onDeck('error', () => {
     if (P.engine !== 'audio' || !audio.getAttribute('src')) return;
+    loadingEnd();
     P.errors++;
     const name = P.cur ? P.cur.title : 'song';
     log('cannot play ' + name + ' (code ' + (audio.error ? audio.error.code : '?') + ')');
@@ -188,6 +189,7 @@
     }
   }
   function pause() {
+    loadingEnd();
     if (P.engine === 'audio') { moodSnap(); decks.forEach((d) => d.pause()); }
     else if (P.engine === 'embed' && embed.player && embed.ready) embed.player.pauseVideo();
   }
@@ -225,7 +227,30 @@
       const once = () => { d.removeEventListener('loadedmetadata', once); try { d.currentTime = at; } catch (e) { log('resume seek: ' + e.name); } };
       d.addEventListener('loadedmetadata', once);
     }
-    if (autoplay) tryPlay(); else audio.load();
+    if (autoplay) { tryPlay(); loadingStart(); } else audio.load();
+  }
+
+  // YouTube songs download before they play. After a short grace, so cached songs never flash it,
+  // the page and the game show Loading until the song plays.
+  const LOAD = { timer: 0, on: false };
+  const LOAD_TEXT = 'Loading song...';
+  function loadingStart() {
+    loadingEnd();
+    LOAD.timer = setTimeout(() => {
+      LOAD.timer = 0;
+      // The playing event of the new song cancels this timer, so reaching here means it has not started.
+      if (P.engine !== 'audio') return;
+      LOAD.on = true;
+      setNotice(LOAD_TEXT, true);
+      send('loading', { on: true });
+    }, 800);
+  }
+  function loadingEnd() {
+    if (LOAD.timer) { clearTimeout(LOAD.timer); LOAD.timer = 0; }
+    if (!LOAD.on) return;
+    LOAD.on = false;
+    if (el('notice').textContent === LOAD_TEXT) setNotice('');
+    send('loading', { on: false });
   }
 
   // ---------- embed engine (no helper) ----------
@@ -353,9 +378,24 @@
 
   function afterTrackChange() {
     renderList();
-    const nx = Q.items[Q.idx + 1];
-    if (nx && kindOf(nx) === 'yt') hget('/yt/prefetch?id=' + nx.id, 5000).catch(() => {});
+    prefetchAhead();
     if (Q.items.length - Q.idx <= 3) extendWithMix();
+  }
+
+  // Downloads the next two songs ahead so skips start at once. In Mood mode also the other mood's next song.
+  function prefetchAhead() {
+    const ids = [];
+    const loops = Q.fixed && !Q.shuffled && (S.repeat === 'all' || MOOD.on);
+    for (let k = 1; k <= 2; k++) {
+      let it = Q.items[Q.idx + k];
+      if (!it && loops && Q.items.length) it = Q.items[(Q.idx + k) % Q.items.length];
+      if (it && kindOf(it) === 'yt' && it.id !== (P.cur && P.cur.id) && ids.indexOf(it.id) < 0) ids.push(it.id);
+    }
+    ids.forEach((id) => hget('/yt/prefetch?id=' + id, 5000).catch((e) => log('prefetch: ' + e.message)));
+    if (MOOD.on) {
+      const other = MOOD.slots[MOOD.mood === 'calm' ? 'fight' : 'calm'];
+      if (other && other.items.length) moodPrefetch(other);
+    }
   }
 
   // Current song as a queue item, so a queue can start from whatever is playing.
@@ -447,8 +487,7 @@
       Q.items = Q.items.concat(add.slice(0, 40));
       if (Q.items.length > 300) { const drop = Q.items.length - 300; const keep = Math.min(drop, Math.max(0, Q.idx - 20)); Q.items.splice(0, keep); Q.idx -= keep; }
       renderList();
-      const nx = Q.items[Q.idx + 1];
-      if (nx) hget('/yt/prefetch?id=' + nx.id, 5000).catch(() => {});
+      prefetchAhead();
     } catch (e) { log('mix failed: ' + e.message); }
   }
 
